@@ -354,23 +354,17 @@ impl UniformCandidatePEdgeCodec {
         }
         candidates.sort();
 
-        // 2) compute OrbitId per candidate using Option-1 symbol definition:
-        //    orbit id of e in (G_{k-1} ∪ {e})
-        //
-        //    Important: OrbitId type must satisfy OrdSymbol + Default (your snippet).
-        //    We'll use u64 (it usually implements those in this repo).
+        // 2) compute OrbitId per candidate using the post-add graph's colors/degrees.
+        //    For each candidate edge e, we compute sig(e) in (G_{k-1} ∪ {e}).
+        //    This ensures edges producing isomorphic augmented graphs have same orbit.
         let mut orbit_ids_u64: Vec<u64> = Vec::with_capacity(candidates.len());
         for &e in &candidates {
-            let e = canon_edge(e);
             let mut g_plus = g.clone();
             g_plus.insert_plain_edge(e);
 
-            // colors/degrees in post-add graph
             let colors: Vec<usize> = <ColorRefinement as Hashing<PlainGraph<Undirected>>>::apply(cr, &g_plus);
+            let deg: Vec<usize> = g_plus.degrees().collect_vec();
 
-            let deg = g_plus.degrees().collect_vec();
-
-            // reuse your existing edge_sig/hash_sig helpers (computed on g_plus)
             let sig = edge_sig(&colors, &deg, e);
             orbit_ids_u64.push(hash_sig(sig));
         }
@@ -568,9 +562,18 @@ impl<M: EdgeRemovalModel> Codec for Type2EdgeOrbitGraphCodec<M> {
     }
 
     fn pop(&self, msg: &mut Message) -> Self::Symbol {
-        // n,m will be decoded by empty_prefix() inside inner.pop(),
-        // so we can use a dummy inner with (n=0, edges=[]).
-        let inner = type2_edge_orbit_codec(0, vec![], self.convs, self.model.clone());
+        // Peek n and m from message to create codec with correct dimensions.
+        // (ANS stack order: n was pushed last, so pop it first; then m.)
+        let n = LogUniform::max().pop(msg);
+        let m = LogUniform::max().pop(msg);
+
+        // Push them back so inner.pop() can decode them via empty_prefix().
+        LogUniform::max().push(msg, &m);
+        LogUniform::max().push(msg, &n);
+
+        // Create dummy edges vector of correct length.
+        let dummy_edges = vec![(0usize, 0usize); m];
+        let inner = type2_edge_orbit_codec(n, dummy_edges, self.convs, self.model.clone());
         let Unordered(edge_list) = inner.pop(msg);
 
         let mut g = PlainGraph::<Undirected>::plain_empty(edge_list.n);
@@ -606,4 +609,37 @@ pub fn type2_edge_orbit_codec<M: EdgeRemovalModel>(
 /// Helper to wrap as Unordered<EdgeList> if you want to use the Codec trait directly.
 pub fn unordered_edge_list(n: usize, edges: Vec<EdgeIndex>) -> Unordered<EdgeList> {
     Unordered(EdgeList { n, edges })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{Codec, Message};
+
+    #[test]
+    fn test_type2_edge_orbit_roundtrip() {
+        // Small triangle graph: 3 nodes, 3 edges
+        let mut g = PlainGraph::<Undirected>::plain_empty(3);
+        g.insert_plain_edge((0, 1));
+        g.insert_plain_edge((1, 2));
+        g.insert_plain_edge((0, 2));
+
+        let codec = Type2EdgeOrbitGraphCodec {
+            convs: 2,
+            model: UniformCandidateP::new(2),
+        };
+
+        let original = Unordered(g);
+        let mut msg = Message::random(42);
+        codec.push(&mut msg, &original);
+        let decoded = codec.pop(&mut msg);
+
+        // Verify graphs have the same edges
+        let mut orig_edges = original.0.edge_indices();
+        let mut dec_edges = decoded.0.edge_indices();
+        orig_edges.sort();
+        dec_edges.sort();
+        assert_eq!(orig_edges, dec_edges);
+    }
+
 }
