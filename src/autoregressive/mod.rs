@@ -9,6 +9,8 @@ pub mod graph;
 pub mod multiset;
 pub mod prefix_orbit;
 pub mod chunked;
+pub mod edge_orbit;
+
 
 /// A prefixing chain on a permutable class.
 /// Allows to pop or push a slice onto a prefix to obtain a new prefix.

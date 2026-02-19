@@ -10,7 +10,7 @@ use crate::experimental::complete_joint::aut::{joint_shuffle_codec, with_isomorp
 use crate::experimental::complete_joint::graph::EdgeLabelledGraph;
 use crate::experimental::complete_joint::interleaved::interleaved_coset_shuffle_codec;
 use crate::experimental::graph::{erdos_renyi_indices, num_all_edge_indices, polya_urn, EmptyCodec, ErdosRenyiSliceCodecs, GraphIID};
-use crate::graph::{ColorRefinement, EdgeType, Graph, UnGraph, Undirected};
+use crate::graph::{ColorRefinement, EdgeType, Graph, UnGraph, Undirected, PlainGraph};
 use crate::joint::incomplete::cr_joint_shuffle_codec;
 use crate::permutable::{Complete, Perm, Permutable, PermutableCodec, PermutationUniform, Unordered};
 use clap::Parser;
@@ -22,6 +22,7 @@ use std::io::{stdout, Write};
 use std::marker::PhantomData;
 use std::ops::{Deref, Range};
 use timeit::timeit_loops;
+use crate::autoregressive::edge_orbit;
 
 #[macro_use]
 pub mod datasets;
@@ -221,6 +222,13 @@ impl Benchmark {
                 }
             }
         }
+
+        if self.config.t2 {
+            // name it similarly to other CR-based methods
+            let t2_name = format!("cr{}t2", self.config.convs);
+            print_codec(&t2_name);
+        }
+
         println!();
     }
 }
@@ -263,6 +271,7 @@ impl DatasetBenchmark<'_> {
                     (loops, edge, EmptyCodec::default(), EmptyCodec::default())
                 }, uniform_er_only);
             }
+            self.run_type2_edge_orbit(&graphs);
         } else if let Some(graphs) = self.dataset.edge_labelled_graphs() {
             print_flush!("edges ");
             let graphs = self.sorted(graphs.clone());
@@ -570,6 +579,40 @@ impl DatasetBenchmark<'_> {
         }
         graphs
     }
+
+    fn run_type2_edge_orbit<N: OrdSymbol + Default, E: OrdSymbol, Ty: EdgeType>(
+        &self,
+        graphs: &Vec<Graph<N, E, Ty>>,
+    )
+    where
+        Graph<N, E, Ty>: AutCanonizable,
+    {
+        if !self.config.t2 { return; }
+
+        // Convert each Graph -> your EdgeList representation.
+        // You need a way to iterate edges as (u,v). Use the repo’s edge iterator if available.
+        let edge_lists = graphs.iter().map(|g| {
+            let n = g.len();
+            let edges = g.edge_indices();
+            let mut pg = PlainGraph::<Undirected>::plain_empty(n);
+            for e in edges {
+                pg.insert_plain_edge(e);
+            }
+            Unordered(pg)
+        }).collect_vec();
+
+        // One codec per graph (because n,m vary)
+        let convs = self.config.convs;
+        let codecs = graphs.iter().map(|_g| {
+            edge_orbit::Type2EdgeOrbitGraphCodec {
+                convs,
+                model: edge_orbit::UniformCandidateP::new(convs), // or whatever model you want
+            }
+        }).collect_vec();
+
+        let codec = Independent::new(codecs);
+        test_and_print(&codec, &edge_lists, self.config.seeds());
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -678,6 +721,11 @@ pub struct TestConfig {
     #[clap(short, long)]
     pub ar: bool,
 
+    /// Run Type-2 edge-orbit (bits-back) shuffle codec (our method).
+    #[clap(long)]
+    pub t2: bool,
+
+
     /// Number of color refinement convolutions used for incomplete shuffle coding.
     #[clap(long, default_value = "4")]
     pub convs: usize,
@@ -772,6 +820,7 @@ impl TestConfig {
             seed,
             seeds: 1,
             isomorphism_test_max_len: usize::MAX,
+            t2: true,
         }
     }
 
