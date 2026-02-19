@@ -19,6 +19,9 @@ use itertools::Itertools;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
 
 /// An ordered edge list (the thing we permute).
 /// `len_active` is the current prefix length in the prefix chain.
@@ -65,6 +68,10 @@ impl Permutable for EdgePrefix {
 pub type EdgeSlice = EdgeIndex;
 
 fn canon_edge((u,v): EdgeIndex) -> EdgeIndex { if u < v {(u,v)} else {(v,u)} }
+
+// ============================================================================
+// PREFIXING CHAIN
+// ============================================================================
 
 /// Prefixing chain that removes edges from the remaining graph.
 /// pop_slice removes the *last active* edge (after swaps by orbit selection).
@@ -119,15 +126,18 @@ impl PrefixingChain for EdgePrefixingChain {
     }
 }
 
-/// --- Orbit IDs for edges (your "sig") --------------------------------------
+// ============================================================================
+// ORBIT COMPUTATION (q codec helpers)
+// ============================================================================
+
+/// Compute edge signature for orbit partitioning.
 ///
 /// We approximate edge orbits using:
 ///   - node colors from ColorRefinement on the remaining graph
 ///   - degrees
 ///   - (min/max) normalization for undirected edges
 ///
-/// This is exactly your sig(e) idea; the only subtlety is:
-/// edges in the same bucket should share the SAME computed id at that step,
+/// Edges in the same bucket share the same computed id at that step,
 /// but the id can change after removals because colors/degrees change.
 fn edge_sig(node_color: &[usize], deg: &[usize], (u, v): EdgeIndex) -> (usize, usize, usize, usize) {
     let (cu, cv) = (node_color[u], node_color[v]);
@@ -206,13 +216,14 @@ impl PrefixFn<EdgePrefixingChain> for EdgeOrbitCodecs {
     }
 }
 
-/// --- p(edge | G_{k-1}) -----------------------------------------------------
-///
-/// Encodes the removed edge given the post-removal graph G_{k-1}.
-/// The p codec encodes edges uniformly among all candidate (missing) edges.
-/// Orbit-based bits-back coding is handled by q (EdgeOrbitCodecs), not here.
+// ============================================================================
+// P MODEL (edge removal model)
+// ============================================================================
 
 /// Uniform distribution over candidate edges (missing edges in G_{k-1}).
+///
+/// The p codec encodes edges uniformly among all candidate (missing) edges.
+/// Orbit-based bits-back coding is handled by q (EdgeOrbitCodecs), not here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UniformCandidateP {
     pub cr: ColorRefinement,
@@ -288,6 +299,10 @@ impl EdgeRemovalModel for UniformCandidateP {
         UniformCandidatePEdgeCodec::build(prefix_after_removal, &self.cr)
     }
 }
+
+// ============================================================================
+// INTEGRATION (slice codecs, graph codec)
+// ============================================================================
 
 /// Slice codecs wrapper required by the autoregressive engine:
 /// it must produce a slice codec given the current prefix, and support the fused push/pop.
@@ -425,6 +440,10 @@ impl<M: EdgeRemovalModel> Codec for Type2EdgeOrbitGraphCodec<M> {
     fn bits(&self, _x: &Self::Symbol) -> Option<f64> { None }
 }
 
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
 /// Public constructor:
 /// returns a full autoregressive shuffle codec for unordered edge sets (graphs).
 pub fn type2_edge_orbit_codec<M: EdgeRemovalModel>(
@@ -448,6 +467,10 @@ pub fn type2_edge_orbit_codec<M: EdgeRemovalModel>(
 pub fn unordered_edge_list(n: usize, edges: Vec<EdgeIndex>) -> Unordered<EdgeList> {
     Unordered(EdgeList { n, edges })
 }
+
+// ============================================================================
+// TESTS
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
