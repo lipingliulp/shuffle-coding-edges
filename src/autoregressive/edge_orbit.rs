@@ -300,6 +300,112 @@ impl EdgeRemovalModel for UniformCandidateP {
     }
 }
 
+/// Orbit-coded distribution over candidate edges.
+///
+/// Groups candidates by orbit signature, then:
+/// 1. Encodes which orbit (prob ∝ orbit size)
+/// 2. Encodes position within orbit (uniform)
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrbitCandidateP {
+    pub cr: ColorRefinement,
+}
+
+impl OrbitCandidateP {
+    pub fn new(wl_rounds: usize) -> Self {
+        Self { cr: ColorRefinement::new(wl_rounds, false) }
+    }
+}
+
+/// Orbit-coded slice codec for candidate edges.
+#[derive(Clone, Debug)]
+pub struct OrbitCandidatePEdgeCodec {
+    /// All candidate edges grouped by orbit: orbits[orbit_rank] = vec of edges in that orbit
+    orbits: Vec<Vec<EdgeIndex>>,
+    /// Map from edge to (orbit_rank, position_in_orbit)
+    edge_to_orbit: std::collections::HashMap<EdgeIndex, (usize, usize)>,
+}
+
+impl OrbitCandidatePEdgeCodec {
+    pub fn build(prefix_after_removal: &EdgePrefix, cr: &ColorRefinement) -> Self {
+        let g = &prefix_after_removal.g;
+        let n = prefix_after_removal.list.n;
+
+        // Compute colors and degrees for G_{k-1}
+        let colors: Vec<usize> = <ColorRefinement as Hashing<PlainGraph<Undirected>>>::apply(cr, g);
+        let deg: Vec<usize> = g.degrees().collect_vec();
+
+        // Enumerate candidates and compute their orbit signatures
+        let mut sig_to_edges: std::collections::HashMap<u64, Vec<EdgeIndex>> = std::collections::HashMap::new();
+        for u in 0..n {
+            for v in (u + 1)..n {
+                let e = canon_edge((u, v));
+                if g.has_edge(&e) { continue; }
+                let sig = edge_sig(&colors, &deg, e);
+                let h = hash_sig(sig);
+                sig_to_edges.entry(h).or_default().push(e);
+            }
+        }
+
+        // Sort signatures for deterministic orbit ordering
+        let mut sorted_sigs: Vec<u64> = sig_to_edges.keys().cloned().collect();
+        sorted_sigs.sort();
+
+        // Build orbits and reverse map
+        let mut orbits: Vec<Vec<EdgeIndex>> = Vec::with_capacity(sorted_sigs.len());
+        let mut edge_to_orbit = std::collections::HashMap::new();
+
+        for (orbit_rank, sig) in sorted_sigs.iter().enumerate() {
+            let mut edges = sig_to_edges.remove(sig).unwrap();
+            edges.sort(); // deterministic ordering within orbit
+            for (pos, &e) in edges.iter().enumerate() {
+                edge_to_orbit.insert(e, (orbit_rank, pos));
+            }
+            orbits.push(edges);
+        }
+
+        Self { orbits, edge_to_orbit }
+    }
+}
+
+impl Codec for OrbitCandidatePEdgeCodec {
+    type Symbol = EdgeIndex;
+
+    fn push(&self, m: &mut Message, x: &Self::Symbol) {
+        let e = canon_edge(*x);
+        let &(orbit_rank, pos_in_orbit) = self.edge_to_orbit.get(&e)
+            .expect("edge not in candidates");
+
+        // Encode position within orbit (uniform)
+        let orbit_size = self.orbits[orbit_rank].len();
+        Uniform::new(orbit_size).push(m, &pos_in_orbit);
+
+        // Encode orbit index (uniform over orbits for now)
+        // TODO: Could weight by orbit size for better compression
+        Uniform::new(self.orbits.len()).push(m, &orbit_rank);
+    }
+
+    fn pop(&self, m: &mut Message) -> Self::Symbol {
+        // Decode orbit rank
+        let orbit_rank = Uniform::new(self.orbits.len()).pop(m);
+
+        // Decode position within orbit
+        let orbit_size = self.orbits[orbit_rank].len();
+        let pos_in_orbit = Uniform::new(orbit_size).pop(m);
+
+        self.orbits[orbit_rank][pos_in_orbit]
+    }
+
+    fn bits(&self, _x: &Self::Symbol) -> Option<f64> { None }
+}
+
+impl EdgeRemovalModel for OrbitCandidateP {
+    type SliceCodec = OrbitCandidatePEdgeCodec;
+
+    fn codec_for_removed_edge(&self, prefix_after_removal: &EdgePrefix) -> Self::SliceCodec {
+        OrbitCandidatePEdgeCodec::build(prefix_after_removal, &self.cr)
+    }
+}
+
 // ============================================================================
 // INTEGRATION (slice codecs, graph codec)
 // ============================================================================
@@ -541,6 +647,57 @@ mod tests {
         let codec = Type2EdgeOrbitGraphCodec {
             convs: 2,
             model: UniformCandidateP::new(2),
+        };
+
+        let original = Unordered(g);
+        let mut msg = Message::random(123);
+        codec.push(&mut msg, &original);
+        let decoded = codec.pop(&mut msg);
+
+        let mut orig_edges = original.0.edge_indices();
+        let mut dec_edges = decoded.0.edge_indices();
+        orig_edges.sort();
+        dec_edges.sort();
+        assert_eq!(orig_edges, dec_edges);
+    }
+
+    #[test]
+    fn test_type2_orbit_p_roundtrip() {
+        // Test with orbit-coded p model
+        let mut g = PlainGraph::<Undirected>::plain_empty(4);
+        g.insert_plain_edge((0, 1));
+        g.insert_plain_edge((1, 2));
+        g.insert_plain_edge((2, 3));
+        g.insert_plain_edge((3, 0));
+
+        let codec = Type2EdgeOrbitGraphCodec {
+            convs: 2,
+            model: OrbitCandidateP::new(2),
+        };
+
+        let original = Unordered(g);
+        let mut msg = Message::random(42);
+        codec.push(&mut msg, &original);
+        let decoded = codec.pop(&mut msg);
+
+        let mut orig_edges = original.0.edge_indices();
+        let mut dec_edges = decoded.0.edge_indices();
+        orig_edges.sort();
+        dec_edges.sort();
+        assert_eq!(orig_edges, dec_edges);
+    }
+
+    #[test]
+    fn test_type2_orbit_p_triangle() {
+        // Triangle with orbit-coded p
+        let mut g = PlainGraph::<Undirected>::plain_empty(3);
+        g.insert_plain_edge((0, 1));
+        g.insert_plain_edge((1, 2));
+        g.insert_plain_edge((0, 2));
+
+        let codec = Type2EdgeOrbitGraphCodec {
+            convs: 2,
+            model: OrbitCandidateP::new(2),
         };
 
         let original = Unordered(g);

@@ -606,7 +606,7 @@ impl DatasetBenchmark<'_> {
         let codecs = graphs.iter().map(|_g| {
             edge_orbit::Type2EdgeOrbitGraphCodec {
                 convs,
-                model: edge_orbit::UniformCandidateP::new(convs), // or whatever model you want
+                model: edge_orbit::OrbitCandidateP::new(convs),
             }
         }).collect_vec();
 
