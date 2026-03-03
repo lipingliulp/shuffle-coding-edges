@@ -1,0 +1,43 @@
+# Future Improvements for Type-2 Edge Orbit Codec
+
+## 1. Orbit-Coded p Model (Compression Improvement)
+
+Current: p encodes edges uniformly among all candidates (missing edges).
+Result: ~25% worse compression than node-based approach (13,482 vs 10,837 bits on USAir97).
+
+### Proposed Change
+
+Implement orbit-coded p that:
+1. Groups candidate edges by orbit (same signature = same orbit)
+2. Encodes which orbit the edge is in (prob proportional to orbit size)
+3. Encodes position within orbit (uniform)
+
+### Key Constraint
+
+p and q must be complementary, not duplicating:
+- q handles orbit selection for EXISTING edges (bits-back)
+- p should handle orbit structure for CANDIDATE edges
+
+### Implementation Notes
+
+- Reuse edge_sig() and hash_sig() for candidate orbit partitioning
+- Use FixPrefixOrbitCodec pattern from prefix_orbit.rs
+- Ensure encoding/decoding are exact inverses
+
+
+## 2. Incremental Color Refinement (Speed Improvement)
+
+Current: Recomputes color refinement from scratch after each edge removal.
+
+### Proposed Change
+
+Incrementally update colors when an edge is removed, rather than full recomputation.
+
+
+## 3. Better Orbit Approximation
+
+Current: Uses (color[u], color[v], deg[u], deg[v]) signature.
+
+### Proposed Change
+
+Consider richer signatures that capture more graph structure while remaining efficient.

@@ -1,31 +1,27 @@
-//! Type-2 equivalence sequentialization for edge orders using orbit (bits-back) coding.
+//! Type-2 equivalence for edge orders using orbit (bits-back) coding.
 //!
-//! We treat an ordered edge list as the "ordered object" (length m).
-//! The unordered object is the *set* of edges (i.e., the graph).
+//! Implements autoregressive shuffle coding where edges are removed one at a time,
+//! with orbit-based bits-back coding to exploit graph symmetries.
 //!
-//! At each step k, we:
-//!   (1) build an orbit partition of the remaining-edge graph G_k
-//!   (2) decode an orbit id o_k ~ q(o_k | G_k) (ANS pop; bits-back)
-//!   (3) deterministically choose a representative edge inside that orbit
-//!   (4) remove that edge -> G_{k-1}
-//!   (5) encode the removed edge with p( edge | G_{k-1} )  (ANS push)
-//
-// This matches the control flow of AutoregressivePrefixShuffleCodec:
-// orbit is decoded first (pop), then a slice is encoded (push).  :contentReference[oaicite:2]{index=2}
+//! At each step k:
+//!   1. Build orbit partition of edges in G_k using color refinement
+//!   2. Decode orbit id o_k ~ q(o_k | G_k) via ANS pop (bits-back)
+//!   3. Select representative edge from that orbit
+//!   4. Remove edge to get G_{k-1}
+//!   5. Encode removed edge with p(edge | G_{k-1}) via ANS push
 
 use crate::autoregressive::prefix_orbit::FixPrefixOrbitCodec;
-use crate::autoregressive::{
-    InnerSliceCodecs, PrefixFn, PrefixingChain,
-};
+use crate::autoregressive::{InnerSliceCodecs, PrefixFn, PrefixingChain, UnfusedAutoregressiveShuffleCodec};
 use crate::codec::{Codec, LogUniform, Message, Uniform};
 use crate::graph::{ColorRefinement, EdgeIndex, PlainGraph, Undirected};
-use crate::permutable::{Len, Permutable, Unordered, Hashing};
+use crate::permutable::{Hashing, Len, Permutable, Unordered};
 use itertools::Itertools;
-use std::marker::PhantomData;
 use std::fmt::Debug;
-// use std::collections::BTreeMap;
-use crate::autoregressive::UnfusedAutoregressiveShuffleCodec;
+use std::marker::PhantomData;
 
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
 
 /// An ordered edge list (the thing we permute).
 /// `len_active` is the current prefix length in the prefix chain.
@@ -73,6 +69,9 @@ pub type EdgeSlice = EdgeIndex;
 
 fn canon_edge((u,v): EdgeIndex) -> EdgeIndex { if u < v {(u,v)} else {(v,u)} }
 
+// ============================================================================
+// PREFIXING CHAIN
+// ============================================================================
 
 /// Prefixing chain that removes edges from the remaining graph.
 /// pop_slice removes the *last active* edge (after swaps by orbit selection).
@@ -99,7 +98,6 @@ impl PrefixingChain for EdgePrefixingChain {
         prefix.len_active -= 1;
 
         // Remove from remaining graph G_k -> G_{k-1}.
-        // (Graph is undirected PlainGraph; remove both directed entries handled internally.) :contentReference[oaicite:3]{index=3}
         prefix.g.remove_plain_edge(e);
 
         e
@@ -128,16 +126,19 @@ impl PrefixingChain for EdgePrefixingChain {
     }
 }
 
-/// --- Orbit IDs for edges (your "sig") --------------------------------------
+// ============================================================================
+// ORBIT COMPUTATION (q codec helpers)
+// ============================================================================
+
+/// Compute edge signature for orbit partitioning.
 ///
 /// We approximate edge orbits using:
 ///   - node colors from ColorRefinement on the remaining graph
 ///   - degrees
 ///   - (min/max) normalization for undirected edges
 ///
-/// This is exactly your sig(e) idea; the only subtlety is:
-/// edges in the same bucket should share the SAME computed id at that step,
-/// but the id can change after removals because colors/degrees change. :contentReference[oaicite:4]{index=4}
+/// Edges in the same bucket share the same computed id at that step,
+/// but the id can change after removals because colors/degrees change.
 fn edge_sig(node_color: &[usize], deg: &[usize], (u, v): EdgeIndex) -> (usize, usize, usize, usize) {
     let (cu, cv) = (node_color[u], node_color[v]);
     let (du, dv) = (deg[u], deg[v]);
@@ -149,8 +150,7 @@ fn edge_sig(node_color: &[usize], deg: &[usize], (u, v): EdgeIndex) -> (usize, u
 }
 
 
-/// A simple stable hash into a single OrdSymbol.
-/// We keep it as u64 so it can be ranked to orbit ids by FixPrefixOrbitCodec. :contentReference[oaicite:5]{index=5}
+/// Hash the edge signature into a single u64 for orbit partitioning.
 fn hash_sig(sig: (usize, usize, usize, usize)) -> u64 {
     let (a, b, c, d) = sig;
 
@@ -168,10 +168,8 @@ fn hash_sig(sig: (usize, usize, usize, usize)) -> u64 {
     x
 }
 
-
-
 /// Orbit-codecs factory: given a prefix (remaining graph), build a distribution over edge-orbit ids.
-/// This implements q(o_k | G_k) ∝ |orbit| by using FixPrefixOrbitCodec masses = orbit sizes. :contentReference[oaicite:6]{index=6}
+/// This implements q(o_k | G_k) ∝ |orbit| by using FixPrefixOrbitCodec masses = orbit sizes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeOrbitCodecs {
     pub cr: ColorRefinement,
@@ -184,12 +182,9 @@ impl PrefixFn<EdgePrefixingChain> for EdgeOrbitCodecs {
         // Remaining graph G_k:
         let g = &x.g;
 
-        // Node "colors": use ColorRefinement hashes. :contentReference[oaicite:7]{index=7}
-        // ColorRefinement::apply returns Vec<u64> (node hashes) for graphs in this repo. :contentReference[oaicite:8]{index=8}
+        // Node colors from color refinement.
         let colors: Vec<usize> = <ColorRefinement as Hashing<PlainGraph<Undirected>>>::apply(&self.cr, g);
 
-
-        
         // Degrees:
         let deg = g.degrees().collect_vec();
 
@@ -221,104 +216,14 @@ impl PrefixFn<EdgePrefixingChain> for EdgeOrbitCodecs {
     }
 }
 
-// impl OrbitCodecs<EdgePrefixingChain> for EdgeOrbitCodecs {}
+// ============================================================================
+// P MODEL (edge removal model)
+// ============================================================================
 
-/// --- p(edge | G_{k-1}) -----------------------------------------------------
+/// Uniform distribution over candidate edges (missing edges in G_{k-1}).
 ///
-/// “True orbit-coded p” in your terms = p models the removed edge under the
-/// *post-removal* remaining graph G_{k-1}.
-///
-/// This trait lets you plug in any model you want.
-/// The default implementation below is a simple uniform over a candidate set,
-/// but the interface supports a fully-featured orbit-coded p.
-
-// #[derive(Clone, Copy, Debug)]
-// pub struct EndpointsCodec {
-//     pub n: usize,
-// }
-
-// impl Codec for EndpointsCodec {
-//     type Symbol = (usize, usize);
-
-//     fn push(&self, m: &mut Message, x: &Self::Symbol) {
-//         let (u, v) = *x;
-//         debug_assert!(u < self.n && v < self.n && u != v);
-
-//         // encode u in [0, n)
-//         EndpointsCodec{ n }.push(m, &u);
-
-//         // encode v in [0, n-1) after "skipping" u
-//         let v_packed = if v < u { v } else { v - 1 };
-//         EndpointsCodec{self.n - 1}.push(m, &v_packed);
-//     }
-
-//     fn pop(&self, m: &mut Message) -> Self::Symbol {
-//         let v_packed = EndpointsCodec{self.n - 1}.pop(m);
-//         let u = EndpointsCodec{ n }.pop(m);
-
-//         let v = if v_packed < u { v_packed } else { v_packed + 1 };
-//         (u, v)
-//     }
-
-//     fn bits(&self, x: &Self::Symbol) -> Option<f64> {
-//         let (u, v) = *x;
-//         if u >= self.n || v >= self.n || u == v { return None; }
-//         Some(EndpointsCodec{ n }.uni_bits() + EndpointsCodec{self.n - 1}.uni_bits())
-//     }
-// }
-
-
-// pub trait EdgeRemovalModel: Clone + Debug + Eq + PartialEq + Send + Sync + 'static {
-//     /// Build a codec to encode the removed edge given the *current* prefix (which is already G_{k-1}).
-//     fn codec_for_removed_edge(&self, prefix_after_removal: &EdgePrefix) -> Uniform;
-// }
-
-
-// /// Minimal baseline: encode the removed edge as a uniform index into the active edge list.
-// /// (You will replace this with your option (B) model.)
-// #[derive(Clone, Debug, Eq, PartialEq)]
-// pub struct UniformEdgeModel;
-
-// impl EdgeRemovalModel for UniformEdgeModel {
-//     fn codec_for_removed_edge(&self, prefix_after_removal: &EdgePrefix) -> Uniform {
-//         // We encode an index into [0..m_total], but only the removed edge itself is known at that moment.
-//         // Simpler: encode endpoints directly with Uniform(n) twice (wastes bits).
-//         let n = prefix_after_removal.list.n;
-//         #[derive(Clone, Debug, Eq, PartialEq)]
-//         struct EndpointsCodec {
-//             n: usize,
-//         }
-//         impl Codec for EndpointsCodec {
-//             type Symbol = EdgeSlice;
-//             fn push(&self, m: &mut Message, x: &Self::Symbol) {
-//                 let (u, v) = *x;
-//                 Uniform::new(self.n).push(m, &u);
-//                 Uniform::new(self.n).push(m, &v);
-//             }
-//             fn pop(&self, m: &mut Message) -> Self::Symbol {
-//                 let u = Uniform::new(self.n).pop(m);
-//                 let v = Uniform::new(self.n).pop(m);
-//                 (u, v)
-//             }
-//             fn bits(&self, _x: &Self::Symbol) -> Option<f64> {
-//                 Some(2.0 * Uniform::new(self.n).uni_bits())
-//             }
-//         }
-//         Uniform::new(n)
-
-//     }
-// }
-
-
-
-/// Orbit-coded p model (baseline):
-/// - Candidate set A(G) = all non-edges among 0..n-1.
-/// - Bucket candidates by (approx) orbit key.
-/// - p(bucket) ∝ bucket size; uniform within bucket.
-
-/// p = uniform over candidate edges, factorized as:
-///   choose orbit rank with prob ∝ orbit size (FixPrefixOrbitCodec categorical),
-///   then choose uniformly within that orbit.
+/// The p codec encodes edges uniformly among all candidate (missing) edges.
+/// Orbit-based bits-back coding is handled by q (EdgeOrbitCodecs), not here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UniformCandidateP {
     pub cr: ColorRefinement,
@@ -331,19 +236,18 @@ impl UniformCandidateP {
 }
 
 /// Slice codec built at each step from current G_{k-1}.
+/// Encodes edges uniformly among all candidates (missing edges).
 #[derive(Clone, Debug)]
 pub struct UniformCandidatePEdgeCodec {
     candidates: Vec<EdgeIndex>,     // missing edges, sorted
-    orbit: FixPrefixOrbitCodec,     // built over candidates, using post-add orbit ids
-    members_by_orbit: Vec<Vec<usize>>, 
 }
 
 impl UniformCandidatePEdgeCodec {
-    pub fn build(prefix_after_removal: &EdgePrefix, cr: &ColorRefinement) -> Self {
+    pub fn build(prefix_after_removal: &EdgePrefix, _cr: &ColorRefinement) -> Self {
         let g = &prefix_after_removal.g;
         let n = prefix_after_removal.list.n;
 
-        // 1) enumerate candidates A(G_{k-1}) = all missing edges (fixed-n)
+        // Enumerate candidates A(G_{k-1}) = all missing edges (fixed-n)
         let mut candidates = Vec::new();
         for u in 0..n {
             for v in (u + 1)..n {
@@ -354,40 +258,7 @@ impl UniformCandidatePEdgeCodec {
         }
         candidates.sort();
 
-        // 2) compute OrbitId per candidate using Option-1 symbol definition:
-        //    orbit id of e in (G_{k-1} ∪ {e})
-        //
-        //    Important: OrbitId type must satisfy OrdSymbol + Default (your snippet).
-        //    We'll use u64 (it usually implements those in this repo).
-        let mut orbit_ids_u64: Vec<u64> = Vec::with_capacity(candidates.len());
-        for &e in &candidates {
-            let e = canon_edge(e);
-            let mut g_plus = g.clone();
-            g_plus.insert_plain_edge(e);
-
-            // colors/degrees in post-add graph
-            let colors: Vec<usize> = <ColorRefinement as Hashing<PlainGraph<Undirected>>>::apply(cr, &g_plus);
-
-            let deg = g_plus.degrees().collect_vec();
-
-            // reuse your existing edge_sig/hash_sig helpers (computed on g_plus)
-            let sig = edge_sig(&colors, &deg, e);
-            orbit_ids_u64.push(hash_sig(sig));
-        }
-
-        // 3) Build FixPrefixOrbitCodec over candidates. Masses = orbit sizes.
-        let orbit = FixPrefixOrbitCodec::new(orbit_ids_u64, candidates.len());
-        // build deterministic orbit members
-        let num_orbits = 1 + *orbit.ids.iter().max().unwrap_or(&0);
-        let mut members_by_orbit = vec![Vec::<usize>::new(); num_orbits];
-        for i in 0..candidates.len() {
-            members_by_orbit[orbit.ids[i]].push(i);
-        }
-        for mem in &mut members_by_orbit {
-            mem.sort_by_key(|&idx| candidates[idx]); // stable deterministic order
-        }
-
-        Self { candidates, orbit, members_by_orbit }
+        Self { candidates }
     }
 
     fn locate_candidate(&self, e: EdgeIndex) -> usize {
@@ -396,46 +267,21 @@ impl UniformCandidatePEdgeCodec {
             .binary_search(&e)
             .expect("edge not in A(G_{k-1}) (encoder/decoder mismatch)")
     }
-
-    // fn position_in_orbit(members: &[usize], element_idx: usize) -> usize {
-    //     // members is a Vec<usize> of element indices belonging to the orbit rank.
-    //     // VecOrbits::new typically stores indices in sorted/insertion order; to be safe:
-    //     members.iter().position(|&j| j == element_idx).unwrap()
-    // }
 }
 
 impl Codec for UniformCandidatePEdgeCodec {
     type Symbol = EdgeIndex;
 
     fn push(&self, m: &mut Message, x: &Self::Symbol) {
-        // element index in candidate list
+        // Encode edge uniformly among all candidates.
+        // The orbit structure for bits-back is handled by q (EdgeOrbitCodecs), not p.
         let element_idx = self.locate_candidate(*x);
-
-        // // orbit rank for this element (already computed by FixPrefixOrbitCodec::ranks)
-        let orbit_rank = self.orbit.ids[element_idx];
-
-        // --- encode orbit_rank with mass ∝ orbit size ---
-        // FenwickTree<usize> is used as categorical in FixPrefixOrbitCodec::new.
-        // In this repo it is used as a codec over indices (push/pop). If your FenwickTree
-        // methods are named differently, swap these two calls accordingly.
-        self.orbit.push(m, &orbit_rank);
-        
-
-        let members = &self.members_by_orbit[orbit_rank];
-        let within = members.iter().position(|&j| j == element_idx).unwrap();
-        Uniform::new(members.len()).push(m, &within);
-
+        Uniform::new(self.candidates.len()).push(m, &element_idx);
     }
 
     fn pop(&self, m: &mut Message) -> Self::Symbol {
-        // decode orbit_rank first
-        let orbit_rank = self.orbit.pop(m);
-        let members = &self.members_by_orbit[orbit_rank];
-
-        let within = Uniform::new(members.len()).pop(m);
-        let element_idx = members[within];
+        let element_idx = Uniform::new(self.candidates.len()).pop(m);
         self.candidates[element_idx]
-
     }
 
     fn bits(&self, _x: &Self::Symbol) -> Option<f64> { None }
@@ -454,7 +300,115 @@ impl EdgeRemovalModel for UniformCandidateP {
     }
 }
 
+/// Orbit-coded distribution over candidate edges.
+///
+/// Groups candidates by orbit signature, then:
+/// 1. Encodes which orbit (prob ∝ orbit size)
+/// 2. Encodes position within orbit (uniform)
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrbitCandidateP {
+    pub cr: ColorRefinement,
+}
 
+impl OrbitCandidateP {
+    pub fn new(wl_rounds: usize) -> Self {
+        Self { cr: ColorRefinement::new(wl_rounds, false) }
+    }
+}
+
+/// Orbit-coded slice codec for candidate edges.
+#[derive(Clone, Debug)]
+pub struct OrbitCandidatePEdgeCodec {
+    /// All candidate edges grouped by orbit: orbits[orbit_rank] = vec of edges in that orbit
+    orbits: Vec<Vec<EdgeIndex>>,
+    /// Map from edge to (orbit_rank, position_in_orbit)
+    edge_to_orbit: std::collections::HashMap<EdgeIndex, (usize, usize)>,
+}
+
+impl OrbitCandidatePEdgeCodec {
+    pub fn build(prefix_after_removal: &EdgePrefix, cr: &ColorRefinement) -> Self {
+        let g = &prefix_after_removal.g;
+        let n = prefix_after_removal.list.n;
+
+        // Compute colors and degrees for G_{k-1}
+        let colors: Vec<usize> = <ColorRefinement as Hashing<PlainGraph<Undirected>>>::apply(cr, g);
+        let deg: Vec<usize> = g.degrees().collect_vec();
+
+        // Enumerate candidates and compute their orbit signatures
+        let mut sig_to_edges: std::collections::HashMap<u64, Vec<EdgeIndex>> = std::collections::HashMap::new();
+        for u in 0..n {
+            for v in (u + 1)..n {
+                let e = canon_edge((u, v));
+                if g.has_edge(&e) { continue; }
+                let sig = edge_sig(&colors, &deg, e);
+                let h = hash_sig(sig);
+                sig_to_edges.entry(h).or_default().push(e);
+            }
+        }
+
+        // Sort signatures for deterministic orbit ordering
+        let mut sorted_sigs: Vec<u64> = sig_to_edges.keys().cloned().collect();
+        sorted_sigs.sort();
+
+        // Build orbits and reverse map
+        let mut orbits: Vec<Vec<EdgeIndex>> = Vec::with_capacity(sorted_sigs.len());
+        let mut edge_to_orbit = std::collections::HashMap::new();
+
+        for (orbit_rank, sig) in sorted_sigs.iter().enumerate() {
+            let mut edges = sig_to_edges.remove(sig).unwrap();
+            edges.sort(); // deterministic ordering within orbit
+            for (pos, &e) in edges.iter().enumerate() {
+                edge_to_orbit.insert(e, (orbit_rank, pos));
+            }
+            orbits.push(edges);
+        }
+
+        Self { orbits, edge_to_orbit }
+    }
+}
+
+impl Codec for OrbitCandidatePEdgeCodec {
+    type Symbol = EdgeIndex;
+
+    fn push(&self, m: &mut Message, x: &Self::Symbol) {
+        let e = canon_edge(*x);
+        let &(orbit_rank, pos_in_orbit) = self.edge_to_orbit.get(&e)
+            .expect("edge not in candidates");
+
+        // Encode position within orbit (uniform)
+        let orbit_size = self.orbits[orbit_rank].len();
+        Uniform::new(orbit_size).push(m, &pos_in_orbit);
+
+        // Encode orbit index (uniform over orbits for now)
+        // TODO: Could weight by orbit size for better compression
+        Uniform::new(self.orbits.len()).push(m, &orbit_rank);
+    }
+
+    fn pop(&self, m: &mut Message) -> Self::Symbol {
+        // Decode orbit rank
+        let orbit_rank = Uniform::new(self.orbits.len()).pop(m);
+
+        // Decode position within orbit
+        let orbit_size = self.orbits[orbit_rank].len();
+        let pos_in_orbit = Uniform::new(orbit_size).pop(m);
+
+        self.orbits[orbit_rank][pos_in_orbit]
+    }
+
+    fn bits(&self, _x: &Self::Symbol) -> Option<f64> { None }
+}
+
+impl EdgeRemovalModel for OrbitCandidateP {
+    type SliceCodec = OrbitCandidatePEdgeCodec;
+
+    fn codec_for_removed_edge(&self, prefix_after_removal: &EdgePrefix) -> Self::SliceCodec {
+        OrbitCandidatePEdgeCodec::build(prefix_after_removal, &self.cr)
+    }
+}
+
+// ============================================================================
+// INTEGRATION (slice codecs, graph codec)
+// ============================================================================
 
 /// Slice codecs wrapper required by the autoregressive engine:
 /// it must produce a slice codec given the current prefix, and support the fused push/pop.
@@ -568,9 +522,18 @@ impl<M: EdgeRemovalModel> Codec for Type2EdgeOrbitGraphCodec<M> {
     }
 
     fn pop(&self, msg: &mut Message) -> Self::Symbol {
-        // n,m will be decoded by empty_prefix() inside inner.pop(),
-        // so we can use a dummy inner with (n=0, edges=[]).
-        let inner = type2_edge_orbit_codec(0, vec![], self.convs, self.model.clone());
+        // Peek n and m from message to create codec with correct dimensions.
+        // (ANS stack order: n was pushed last, so pop it first; then m.)
+        let n = LogUniform::max().pop(msg);
+        let m = LogUniform::max().pop(msg);
+
+        // Push them back so inner.pop() can decode them via empty_prefix().
+        LogUniform::max().push(msg, &m);
+        LogUniform::max().push(msg, &n);
+
+        // Create dummy edges vector of correct length.
+        let dummy_edges = vec![(0usize, 0usize); m];
+        let inner = type2_edge_orbit_codec(n, dummy_edges, self.convs, self.model.clone());
         let Unordered(edge_list) = inner.pop(msg);
 
         let mut g = PlainGraph::<Undirected>::plain_empty(edge_list.n);
@@ -583,6 +546,9 @@ impl<M: EdgeRemovalModel> Codec for Type2EdgeOrbitGraphCodec<M> {
     fn bits(&self, _x: &Self::Symbol) -> Option<f64> { None }
 }
 
+// ============================================================================
+// PUBLIC API
+// ============================================================================
 
 /// Public constructor:
 /// returns a full autoregressive shuffle codec for unordered edge sets (graphs).
@@ -606,4 +572,144 @@ pub fn type2_edge_orbit_codec<M: EdgeRemovalModel>(
 /// Helper to wrap as Unordered<EdgeList> if you want to use the Codec trait directly.
 pub fn unordered_edge_list(n: usize, edges: Vec<EdgeIndex>) -> Unordered<EdgeList> {
     Unordered(EdgeList { n, edges })
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{Codec, Message};
+
+    #[test]
+    fn test_type2_edge_orbit_roundtrip() {
+        // Small triangle graph: 3 nodes, 3 edges
+        let mut g = PlainGraph::<Undirected>::plain_empty(3);
+        g.insert_plain_edge((0, 1));
+        g.insert_plain_edge((1, 2));
+        g.insert_plain_edge((0, 2));
+
+        let codec = Type2EdgeOrbitGraphCodec {
+            convs: 2,
+            model: UniformCandidateP::new(2),
+        };
+
+        let original = Unordered(g);
+        let mut msg = Message::random(42);
+        codec.push(&mut msg, &original);
+        let decoded = codec.pop(&mut msg);
+
+        // Verify graphs have the same edges
+        let mut orig_edges = original.0.edge_indices();
+        let mut dec_edges = decoded.0.edge_indices();
+        orig_edges.sort();
+        dec_edges.sort();
+        assert_eq!(orig_edges, dec_edges);
+    }
+
+    #[test]
+    fn test_type2_edge_orbit_4cycle() {
+        // 4-cycle: 0-1-2-3-0 (4 nodes, 4 edges)
+        let mut g = PlainGraph::<Undirected>::plain_empty(4);
+        g.insert_plain_edge((0, 1));
+        g.insert_plain_edge((1, 2));
+        g.insert_plain_edge((2, 3));
+        g.insert_plain_edge((3, 0));
+
+        let codec = Type2EdgeOrbitGraphCodec {
+            convs: 2,
+            model: UniformCandidateP::new(2),
+        };
+
+        let original = Unordered(g);
+        let mut msg = Message::random(123);
+        codec.push(&mut msg, &original);
+        let decoded = codec.pop(&mut msg);
+
+        let mut orig_edges = original.0.edge_indices();
+        let mut dec_edges = decoded.0.edge_indices();
+        orig_edges.sort();
+        dec_edges.sort();
+        assert_eq!(orig_edges, dec_edges);
+    }
+
+    #[test]
+    fn test_type2_edge_orbit_path() {
+        // Path: 0-1-2-3-4 (5 nodes, 4 edges)
+        let mut g = PlainGraph::<Undirected>::plain_empty(5);
+        g.insert_plain_edge((0, 1));
+        g.insert_plain_edge((1, 2));
+        g.insert_plain_edge((2, 3));
+        g.insert_plain_edge((3, 4));
+
+        let codec = Type2EdgeOrbitGraphCodec {
+            convs: 2,
+            model: UniformCandidateP::new(2),
+        };
+
+        let original = Unordered(g);
+        let mut msg = Message::random(123);
+        codec.push(&mut msg, &original);
+        let decoded = codec.pop(&mut msg);
+
+        let mut orig_edges = original.0.edge_indices();
+        let mut dec_edges = decoded.0.edge_indices();
+        orig_edges.sort();
+        dec_edges.sort();
+        assert_eq!(orig_edges, dec_edges);
+    }
+
+    #[test]
+    fn test_type2_orbit_p_roundtrip() {
+        // Test with orbit-coded p model
+        let mut g = PlainGraph::<Undirected>::plain_empty(4);
+        g.insert_plain_edge((0, 1));
+        g.insert_plain_edge((1, 2));
+        g.insert_plain_edge((2, 3));
+        g.insert_plain_edge((3, 0));
+
+        let codec = Type2EdgeOrbitGraphCodec {
+            convs: 2,
+            model: OrbitCandidateP::new(2),
+        };
+
+        let original = Unordered(g);
+        let mut msg = Message::random(42);
+        codec.push(&mut msg, &original);
+        let decoded = codec.pop(&mut msg);
+
+        let mut orig_edges = original.0.edge_indices();
+        let mut dec_edges = decoded.0.edge_indices();
+        orig_edges.sort();
+        dec_edges.sort();
+        assert_eq!(orig_edges, dec_edges);
+    }
+
+    #[test]
+    fn test_type2_orbit_p_triangle() {
+        // Triangle with orbit-coded p
+        let mut g = PlainGraph::<Undirected>::plain_empty(3);
+        g.insert_plain_edge((0, 1));
+        g.insert_plain_edge((1, 2));
+        g.insert_plain_edge((0, 2));
+
+        let codec = Type2EdgeOrbitGraphCodec {
+            convs: 2,
+            model: OrbitCandidateP::new(2),
+        };
+
+        let original = Unordered(g);
+        let mut msg = Message::random(123);
+        codec.push(&mut msg, &original);
+        let decoded = codec.pop(&mut msg);
+
+        let mut orig_edges = original.0.edge_indices();
+        let mut dec_edges = decoded.0.edge_indices();
+        orig_edges.sort();
+        dec_edges.sort();
+        assert_eq!(orig_edges, dec_edges);
+    }
+
 }
