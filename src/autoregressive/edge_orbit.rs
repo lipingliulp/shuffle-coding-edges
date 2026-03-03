@@ -189,7 +189,7 @@ impl PrefixFn<EdgePrefixingChain> for EdgeOrbitCodecs {
         let colors: Vec<usize> = <ColorRefinement as Hashing<PlainGraph<Undirected>>>::apply(&self.cr, g);
 
 
-
+        
         // Degrees:
         let deg = g.degrees().collect_vec();
 
