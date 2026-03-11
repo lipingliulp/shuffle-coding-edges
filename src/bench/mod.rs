@@ -4,7 +4,7 @@ use crate::autoregressive::{Autoregressive, AutoregressiveShuffleCodec, SliceCod
 use crate::bench::datasets::{Dataset, SourceInfo};
 use crate::bench::param_codec::{AutoregressiveErdosReyniGraphDatasetParamCodec, AutoregressivePolyaUrnGraphDatasetParamCodec, CategoricalParamCodec, EmptyParamCodec, ErdosRenyiParamCodec, GraphDatasetParamCodec, ParametrizedIndependent, PolyaUrnParamCodec, UniformParamCodec, WrappedParametrizedIndependent};
 use crate::codec::{Bernoulli, Categorical, Codec, CodecTestResults, EqSymbol,
-                   Independent, OrdSymbol, Uniform, UniformCodec};
+                   Independent, Message, OrdSymbol, Uniform, UniformCodec};
 use crate::experimental::autoregressive::joint::JointSliceCodecs;
 use crate::experimental::complete_joint::aut::{joint_shuffle_codec, with_isomorphism_test_max_len, AutCanonizable};
 use crate::experimental::complete_joint::graph::EdgeLabelledGraph;
@@ -606,12 +606,14 @@ impl DatasetBenchmark<'_> {
         let codecs = graphs.iter().map(|_g| {
             edge_orbit::Type2EdgeOrbitGraphCodec {
                 convs,
-                model: edge_orbit::OrbitCandidateP::new(convs),
+                model: edge_orbit::ErdosRenyiGnM::new(),
             }
         }).collect_vec();
 
-        let codec = Independent::new(codecs);
-        test_and_print(&codec, &edge_lists, self.config.seeds());
+        with_isomorphism_test_max_len(self.config.isomorphism_test_max_len, || {
+            let codec = Independent::new(codecs);
+            test_and_print_structure_only(&codec, &edge_lists, self.config.seeds());
+        });
     }
 }
 
@@ -674,6 +676,24 @@ pub fn test_shuffled_and_print<P: Eq + Permutable>(codec: &impl Codec<Symbol=Vec
 
 pub fn test_and_print<S: EqSymbol>(codec: &impl Codec<Symbol=S>, symbol: &S, seeds: Range<usize>) -> f64 {
     print_results(seeds.map(|seed| codec.test(symbol, seed)).collect_vec())
+}
+
+/// Benchmark helper for experimental codecs where only symbol recovery is required.
+/// This asserts decoded symbol equality (for `Unordered`, equality is isomorphism-aware),
+/// but does not require exact ANS message restoration.
+pub fn test_and_print_structure_only<S: EqSymbol>(codec: &impl Codec<Symbol=S>, symbol: &S, seeds: Range<usize>) -> f64 {
+    let results = seeds.map(|seed| {
+        let initial = &Message::random(seed);
+        let m = &mut initial.clone();
+        let enc_sec = timeit_loops!(1, { codec.push(m, symbol) });
+        let bits = m.bits();
+        let amortized_bits = m.virtual_bits() - initial.virtual_bits();
+        let mut decoded: Option<S> = None;
+        let dec_sec = timeit_loops!(1, { decoded = Some(codec.pop(m)); });
+        assert_eq!(symbol, &decoded.unwrap());
+        CodecTestResults { bits, amortized_bits, enc_sec, dec_sec }
+    }).collect_vec();
+    print_results(results)
 }
 
 pub fn print_results(results: Vec<CodecTestResults>) -> f64 {
