@@ -1,7 +1,13 @@
 use crate::autoregressive::graph::{GraphPrefixingChain, PolyaUrnSliceCodecs};
 use crate::autoregressive::Autoregressive;
-use crate::codec::{Bernoulli, Categorical, Codec, ConstantCodec, Independent, LogUniform, Message, OrdSymbol, Symbol, Uniform, IID};
-use crate::experimental::graph::{erdos_renyi_indices, num_all_edge_indices, polya_urn, AllEdgeIndices, EmptyCodec, ErdosRenyi, ErdosRenyiSliceCodecs, GraphIID, PolyaUrn};
+use crate::codec::{
+    Bernoulli, Categorical, Codec, ConstantCodec, Independent, LogUniform, Message, OrdSymbol,
+    Symbol, Uniform, IID,
+};
+use crate::experimental::graph::{
+    erdos_renyi_indices, num_all_edge_indices, polya_urn, AllEdgeIndices, EmptyCodec, ErdosRenyi,
+    ErdosRenyiSliceCodecs, GraphIID, PolyaUrn,
+};
 use crate::graph::{Directed, EdgeType};
 use crate::permutable::graph::EdgeIndicesCodec;
 use crate::permutable::Len;
@@ -31,11 +37,15 @@ impl Codec for UniformParamCodec {
 }
 
 impl UniformParamCodec {
-    pub fn new(size: Uniform) -> Self { Self { size } }
+    pub fn new(size: Uniform) -> Self {
+        Self { size }
+    }
 }
 
 impl Default for UniformParamCodec {
-    fn default() -> Self { Self::new(Uniform::max()) }
+    fn default() -> Self {
+        Self::new(Uniform::max())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,15 +63,32 @@ impl Codec for SortedDiffRunLengthCodec {
     fn pop(&self, m: &mut Message) -> Self::Symbol {
         let diffs_lens = MaxBenfordIID.pop(m);
         assert_eq!(diffs_lens.len() % 2, 0);
-        let diffs = diffs_lens.iter().enumerate().filter(|&(i, _)| i % 2 == 0).map(|(_, &x)| x).collect_vec();
-        let lens = diffs_lens.iter().enumerate().filter(|&(i, _)| i % 2 != 0).map(|(_, &x)| x).collect_vec();
+        let diffs = diffs_lens
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i % 2 == 0)
+            .map(|(_, &x)| x)
+            .collect_vec();
+        let lens = diffs_lens
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i % 2 != 0)
+            .map(|(_, &x)| x)
+            .collect_vec();
         assert_eq!(diffs.len(), lens.len());
-        let values = diffs.into_iter().scan(0, |state, x| {
-            *state += x;
-            Some(*state)
-        }).collect_vec();
+        let values = diffs
+            .into_iter()
+            .scan(0, |state, x| {
+                *state += x;
+                Some(*state)
+            })
+            .collect_vec();
         assert_eq!(values.len(), lens.len());
-        values.into_iter().zip(lens).flat_map(|(v, len)| vec![v; len]).collect()
+        values
+            .into_iter()
+            .zip(lens)
+            .flat_map(|(v, len)| vec![v; len])
+            .collect()
     }
 
     fn bits(&self, x: &Self::Symbol) -> Option<f64> {
@@ -71,20 +98,33 @@ impl Codec for SortedDiffRunLengthCodec {
 
 impl SortedDiffRunLengthCodec {
     fn diffs_lens(x: &Vec<usize>) -> Vec<usize> {
-        let run_lengths = x.iter().chunk_by(|&&x| x).
-            into_iter().map(|(v, g)| (v, g.count())).collect_vec();
-        [(0, 0)].iter().chain(run_lengths.iter()).collect_vec().windows(2).
-            flat_map(|window| {
+        let run_lengths = x
+            .iter()
+            .chunk_by(|&&x| x)
+            .into_iter()
+            .map(|(v, g)| (v, g.count()))
+            .collect_vec();
+        [(0, 0)]
+            .iter()
+            .chain(run_lengths.iter())
+            .collect_vec()
+            .windows(2)
+            .flat_map(|window| {
                 if let [(prev, _), (next, len)] = window {
                     assert!(next > prev);
                     [next - prev, *len]
-                } else { unreachable!() }
-            }).collect_vec()
+                } else {
+                    unreachable!()
+                }
+            })
+            .collect_vec()
     }
 }
 
 impl Default for SortedDiffRunLengthCodec {
-    fn default() -> Self { Self }
+    fn default() -> Self {
+        Self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,13 +142,18 @@ impl Codec for MaxBenfordIID {
     }
 
     fn pop(&self, m: &mut Message) -> Self::Symbol {
-        self.iid(Self::len_codec().pop(m), Self::bits_codec().pop(m)).pop(m)
+        self.iid(Self::len_codec().pop(m), Self::bits_codec().pop(m))
+            .pop(m)
     }
 
     fn bits(&self, x: &Self::Symbol) -> Option<f64> {
         let len = x.len();
         let bits = LogUniform::get_bits(x.iter().max().unwrap());
-        Some(self.iid(len, bits).bits(x)? + Self::len_codec().bits(&len)? + Self::bits_codec().bits(&bits)?)
+        Some(
+            self.iid(len, bits).bits(x)?
+                + Self::len_codec().bits(&len)?
+                + Self::bits_codec().bits(&bits)?,
+        )
     }
 }
 
@@ -158,7 +203,9 @@ impl Codec for BernoulliParamCodec {
     }
 
     fn pop(&self, m: &mut Message) -> Self::Symbol {
-        Bernoulli { categorical: CategoricalParamCodec.pop(m) }
+        Bernoulli {
+            categorical: CategoricalParamCodec.pop(m),
+        }
     }
 
     fn bits(&self, x: &Self::Symbol) -> Option<f64> {
@@ -179,22 +226,32 @@ impl<Ty: EdgeType> Codec for ErdosRenyiParamCodec<Ty> {
 
     fn push(&self, m: &mut Message, x: &Self::Symbol) {
         assert!(!x.is_empty());
-        self.edge_codec.push(m, &x.first().unwrap().dense.contains.item)
+        self.edge_codec
+            .push(m, &x.first().unwrap().dense.contains.item)
     }
 
     fn pop(&self, m: &mut Message) -> Self::Symbol {
         let edge_index = self.edge_codec.pop(m);
-        self.nums_nodes.iter().map(|&num_nodes| erdos_renyi_indices::<Ty>(num_nodes, edge_index.clone(), self.loops)).collect()
+        self.nums_nodes
+            .iter()
+            .map(|&num_nodes| erdos_renyi_indices::<Ty>(num_nodes, edge_index.clone(), self.loops))
+            .collect()
     }
 
     fn bits(&self, x: &Self::Symbol) -> Option<f64> {
-        self.edge_codec.bits(&x.first().unwrap().dense.contains.item)
+        self.edge_codec
+            .bits(&x.first().unwrap().dense.contains.item)
     }
 }
 
 impl<Ty: EdgeType> ErdosRenyiParamCodec<Ty> {
     pub fn new(nums_nodes: Vec<usize>, loops: bool) -> Self {
-        Self { nums_nodes, loops, edge_codec: BernoulliParamCodec, phantom: PhantomData }
+        Self {
+            nums_nodes,
+            loops,
+            edge_codec: BernoulliParamCodec,
+            phantom: PhantomData,
+        }
     }
 }
 
@@ -213,27 +270,46 @@ impl<Ty: EdgeType> Codec for PolyaUrnParamCodec<Ty> {
     fn push(&self, m: &mut Message, x: &Self::Symbol) {
         assert!(x.iter().all(|x| x.loops() == self.loops));
         assert!(x.iter().all(|x| x.ordered().redraws == self.redraws));
-        assert_eq!(x.iter().map(|x| x.ordered().num_nodes).collect_vec(), self.nums_nodes);
-        self.nums_edges.push(m, &x.iter().map(|x| x.ordered().num_edges).collect())
+        assert_eq!(
+            x.iter().map(|x| x.ordered().num_nodes).collect_vec(),
+            self.nums_nodes
+        );
+        self.nums_edges
+            .push(m, &x.iter().map(|x| x.ordered().num_edges).collect())
     }
 
     fn pop(&self, m: &mut Message) -> Self::Symbol {
         let nums_edges = self.nums_edges.pop(m);
 
-        self.nums_nodes.iter().zip_eq(nums_edges.into_iter()).map(|(num_nodes, nums_edges)|
-            polya_urn(*num_nodes, nums_edges, self.loops, self.redraws)).collect()
+        self.nums_nodes
+            .iter()
+            .zip_eq(nums_edges.into_iter())
+            .map(|(num_nodes, nums_edges)| {
+                polya_urn(*num_nodes, nums_edges, self.loops, self.redraws)
+            })
+            .collect()
     }
 
     fn bits(&self, x: &Self::Symbol) -> Option<f64> {
-        self.nums_edges.bits(&x.iter().map(|x| x.ordered().num_edges).collect())
+        self.nums_edges
+            .bits(&x.iter().map(|x| x.ordered().num_edges).collect())
     }
 }
 
 impl<Ty: EdgeType> PolyaUrnParamCodec<Ty> {
     pub fn new(nums_nodes: Vec<usize>, loops: bool, redraws: bool) -> Self {
-        let nums_edges = Independent::new(nums_nodes.iter().map(
-            |n| { Uniform::new(num_all_edge_indices::<Ty>(*n, loops) + 1) }));
-        Self { nums_nodes, nums_edges, loops, redraws, phantom: PhantomData }
+        let nums_edges = Independent::new(
+            nums_nodes
+                .iter()
+                .map(|n| Uniform::new(num_all_edge_indices::<Ty>(*n, loops) + 1)),
+        );
+        Self {
+            nums_nodes,
+            nums_edges,
+            loops,
+            redraws,
+            phantom: PhantomData,
+        }
     }
 }
 
@@ -245,7 +321,10 @@ pub struct GraphDatasetParamCodec<
     NodeParamC: Codec<Symbol: Codec> = EmptyParamCodec,
     EdgeParamC: Codec<Symbol: Codec<Symbol: OrdSymbol>> = EmptyParamCodec,
     IndicesC: Symbol + EdgeIndicesCodec = ErdosRenyi<Directed>,
-    IndicesParamC: Codec<Symbol=Vec<IndicesC>> = ErdosRenyiParamCodec<<IndicesC as EdgeIndicesCodec>::Ty>> {
+    IndicesParamC: Codec<Symbol = Vec<IndicesC>> = ErdosRenyiParamCodec<
+        <IndicesC as EdgeIndicesCodec>::Ty,
+    >,
+> {
     /// Code the sequence of numbers of nodes for each graph as a categorical distribution:
     pub node: NodeParamC,
     pub edge: EdgeParamC,
@@ -253,12 +332,20 @@ pub struct GraphDatasetParamCodec<
 }
 
 impl<
-    NodeParamC: Codec<Symbol: Codec<Symbol: Eq>>,
-    EdgeParamC: Codec<Symbol: Codec<Symbol: OrdSymbol>>,
-    IndicesC: EdgeIndicesCodec + Symbol,
-    IndicesParamC: Codec<Symbol=Vec<IndicesC>>,
-    IndicesParamCFromNumsNodesAndLoops: Fn(Vec<usize>, bool) -> IndicesParamC + Clone>
-Codec for GraphDatasetParamCodec<IndicesParamCFromNumsNodesAndLoops, NodeParamC, EdgeParamC, IndicesC, IndicesParamC> {
+        NodeParamC: Codec<Symbol: Codec<Symbol: Eq>>,
+        EdgeParamC: Codec<Symbol: Codec<Symbol: OrdSymbol>>,
+        IndicesC: EdgeIndicesCodec + Symbol,
+        IndicesParamC: Codec<Symbol = Vec<IndicesC>>,
+        IndicesParamCFromNumsNodesAndLoops: Fn(Vec<usize>, bool) -> IndicesParamC + Clone,
+    > Codec
+    for GraphDatasetParamCodec<
+        IndicesParamCFromNumsNodesAndLoops,
+        NodeParamC,
+        EdgeParamC,
+        IndicesC,
+        IndicesParamC,
+    >
+{
     type Symbol = Independent<GraphIID<NodeParamC::Symbol, EdgeParamC::Symbol, IndicesC>>;
 
     fn push(&self, m: &mut Message, x: &Self::Symbol) {
@@ -281,8 +368,12 @@ Codec for GraphDatasetParamCodec<IndicesParamCFromNumsNodesAndLoops, NodeParamC,
         let indices = (self.indices)(nums_nodes.clone(), loops).pop(m);
         let node = self.node.pop(m);
         let edge = self.edge.pop(m);
-        Independent::new(nums_nodes.into_iter().zip_eq(indices.into_iter()).map(|(n, indices)|
-            GraphIID::new(n, indices, node.clone(), edge.clone())))
+        Independent::new(
+            nums_nodes
+                .into_iter()
+                .zip_eq(indices.into_iter())
+                .map(|(n, indices)| GraphIID::new(n, indices, node.clone(), edge.clone())),
+        )
     }
 
     fn bits(&self, x: &Self::Symbol) -> Option<f64> {
@@ -291,8 +382,13 @@ Codec for GraphDatasetParamCodec<IndicesParamCFromNumsNodesAndLoops, NodeParamC,
         nums_nodes.reverse();
         let indices = x.codecs.iter().map(|x| x.edges.indices.clone()).collect();
         let loops_bit = 1.;
-        Some(SortedDiffRunLengthCodec::default().bits(&nums_nodes)? + (self.indices)(nums_nodes, first.edges.indices.loops()).bits(&indices)? +
-            self.node.bits(&first.nodes.item)? + self.edge.bits(&first.edges.label)? + loops_bit)
+        Some(
+            SortedDiffRunLengthCodec::default().bits(&nums_nodes)?
+                + (self.indices)(nums_nodes, first.edges.indices.loops()).bits(&indices)?
+                + self.node.bits(&first.nodes.item)?
+                + self.edge.bits(&first.edges.label)?
+                + loops_bit,
+        )
     }
 }
 
@@ -302,60 +398,111 @@ pub struct AutoregressiveErdosReyniGraphDatasetParamCodec<
     NodeParamC: Codec<Symbol: Codec> = EmptyParamCodec,
     EdgeParamC: Codec<Symbol: Codec<Symbol: OrdSymbol>> = EmptyParamCodec,
     IndicesC: EdgeIndicesCodec + Symbol = ErdosRenyi<Directed>,
-    IndicesParamC: Codec<Symbol=Vec<IndicesC>> = ErdosRenyiParamCodec<<IndicesC as EdgeIndicesCodec>::Ty>> {
-    pub joint: GraphDatasetParamCodec<IndicesParamCFromNumsNodesAndLoops, NodeParamC, EdgeParamC, IndicesC, IndicesParamC>,
+    IndicesParamC: Codec<Symbol = Vec<IndicesC>> = ErdosRenyiParamCodec<
+        <IndicesC as EdgeIndicesCodec>::Ty,
+    >,
+> {
+    pub joint: GraphDatasetParamCodec<
+        IndicesParamCFromNumsNodesAndLoops,
+        NodeParamC,
+        EdgeParamC,
+        IndicesC,
+        IndicesParamC,
+    >,
 }
 
 impl<
-    Ty: EdgeType,
-    NodeParamC: Codec<Symbol: Codec<Symbol: Eq + Default>>,
-    EdgeParamC: Codec<Symbol: Codec<Symbol: OrdSymbol>>,
-    IndicesParamC: Codec<Symbol=Vec<ErdosRenyi<Ty>>>,
-    IndicesParamCFromNumsNodesAndLoops: Fn(Vec<usize>, bool) -> IndicesParamC + Clone>
-Codec for AutoregressiveErdosReyniGraphDatasetParamCodec<IndicesParamCFromNumsNodesAndLoops, NodeParamC, EdgeParamC, ErdosRenyi<Ty>, IndicesParamC> {
-    type Symbol = Independent<Autoregressive<GraphPrefixingChain<<NodeParamC::Symbol as Codec>::Symbol, <EdgeParamC::Symbol as Codec>::Symbol, Ty>, ErdosRenyiSliceCodecs<NodeParamC::Symbol, EdgeParamC::Symbol, Ty>>>;
+        Ty: EdgeType,
+        NodeParamC: Codec<Symbol: Codec<Symbol: Eq + Default>>,
+        EdgeParamC: Codec<Symbol: Codec<Symbol: OrdSymbol>>,
+        IndicesParamC: Codec<Symbol = Vec<ErdosRenyi<Ty>>>,
+        IndicesParamCFromNumsNodesAndLoops: Fn(Vec<usize>, bool) -> IndicesParamC + Clone,
+    > Codec
+    for AutoregressiveErdosReyniGraphDatasetParamCodec<
+        IndicesParamCFromNumsNodesAndLoops,
+        NodeParamC,
+        EdgeParamC,
+        ErdosRenyi<Ty>,
+        IndicesParamC,
+    >
+{
+    type Symbol = Independent<
+        Autoregressive<
+            GraphPrefixingChain<
+                <NodeParamC::Symbol as Codec>::Symbol,
+                <EdgeParamC::Symbol as Codec>::Symbol,
+                Ty,
+            >,
+            ErdosRenyiSliceCodecs<NodeParamC::Symbol, EdgeParamC::Symbol, Ty>,
+        >,
+    >;
 
     fn push(&self, m: &mut Message, x: &Self::Symbol) {
-        let er = Independent::new(x.codecs.iter().map(|c| &c.0.slices).map(
-            |c| GraphIID::new(c.len, ErdosRenyi::new(c.has_edge.clone(),
-                                                     AllEdgeIndices { num_nodes: c.len, loops: c.loops, phantom: PhantomData },
-                                                     c.loops), c.node.clone(), c.edge.clone())
-        ));
+        let er = Independent::new(x.codecs.iter().map(|c| &c.0.slices).map(|c| {
+            GraphIID::new(
+                c.len,
+                ErdosRenyi::new(
+                    c.has_edge.clone(),
+                    AllEdgeIndices {
+                        num_nodes: c.len,
+                        loops: c.loops,
+                        phantom: PhantomData,
+                    },
+                    c.loops,
+                ),
+                c.node.clone(),
+                c.edge.clone(),
+            )
+        }));
 
         self.joint.push(m, &er)
     }
 
     fn pop(&self, m: &mut Message) -> Self::Symbol {
-        Independent::new(self.joint.pop(m).codecs.into_iter().map(
-            |c| Autoregressive::new(ErdosRenyiSliceCodecs {
+        Independent::new(self.joint.pop(m).codecs.into_iter().map(|c| {
+            Autoregressive::new(ErdosRenyiSliceCodecs {
                 len: c.nodes.len,
                 has_edge: c.edges.indices.dense.contains.item.clone(),
                 node: c.nodes.item.clone(),
                 edge: c.edges.label.clone(),
                 loops: c.edges.indices.loops(),
                 phantom: PhantomData,
-            })))
+            })
+        }))
     }
 
-    fn bits(&self, _: &Self::Symbol) -> Option<f64> { None }
+    fn bits(&self, _: &Self::Symbol) -> Option<f64> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoregressivePolyaUrnGraphDatasetParamCodec<
     NodeParamC: Codec<Symbol: Codec>,
     EdgeParamC: Codec<Symbol: Codec<Symbol: OrdSymbol>>,
-    Ty: EdgeType> {
+    Ty: EdgeType,
+> {
     pub node: NodeParamC,
     pub edge: EdgeParamC,
     pub phantom: PhantomData<Ty>,
 }
 
 impl<
-    NodeParamC: Codec<Symbol: Codec<Symbol: Eq + Default>>,
-    EdgeParamC: Codec<Symbol: Codec<Symbol: OrdSymbol>>,
-    Ty: EdgeType>
-Codec for AutoregressivePolyaUrnGraphDatasetParamCodec<NodeParamC, EdgeParamC, Ty> {
-    type Symbol = Independent<Autoregressive<GraphPrefixingChain<<NodeParamC::Symbol as Codec>::Symbol, <EdgeParamC::Symbol as Codec>::Symbol, Ty>, PolyaUrnSliceCodecs<NodeParamC::Symbol, EdgeParamC::Symbol, Ty>>>;
+        NodeParamC: Codec<Symbol: Codec<Symbol: Eq + Default>>,
+        EdgeParamC: Codec<Symbol: Codec<Symbol: OrdSymbol>>,
+        Ty: EdgeType,
+    > Codec for AutoregressivePolyaUrnGraphDatasetParamCodec<NodeParamC, EdgeParamC, Ty>
+{
+    type Symbol = Independent<
+        Autoregressive<
+            GraphPrefixingChain<
+                <NodeParamC::Symbol as Codec>::Symbol,
+                <EdgeParamC::Symbol as Codec>::Symbol,
+                Ty,
+            >,
+            PolyaUrnSliceCodecs<NodeParamC::Symbol, EdgeParamC::Symbol, Ty>,
+        >,
+    >;
 
     fn push(&self, m: &mut Message, x: &Self::Symbol) {
         let first = &x.codecs.first().unwrap().0.slices;
@@ -371,26 +518,36 @@ Codec for AutoregressivePolyaUrnGraphDatasetParamCodec<NodeParamC, EdgeParamC, T
         let loops = Bernoulli::new(1, 2).pop(m);
         let node = self.node.pop(m);
         let edge = self.edge.pop(m);
-        Independent::new(nums_nodes.into_iter().rev().map(|n|
-            Autoregressive::new(PolyaUrnSliceCodecs { len: n, node: node.clone(), edge: edge.clone(), loops, phantom: PhantomData })))
+        Independent::new(nums_nodes.into_iter().rev().map(|n| {
+            Autoregressive::new(PolyaUrnSliceCodecs {
+                len: n,
+                node: node.clone(),
+                edge: edge.clone(),
+                loops,
+                phantom: PhantomData,
+            })
+        }))
     }
 
-    fn bits(&self, _: &Self::Symbol) -> Option<f64> { None }
+    fn bits(&self, _: &Self::Symbol) -> Option<f64> {
+        None
+    }
 }
-
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParametrizedIndependent<
     ParamC: Codec<Symbol: Codec>,
-    Infer: Fn(&<ParamC::Symbol as Codec>::Symbol) -> ParamC::Symbol + Clone> {
+    Infer: Fn(&<ParamC::Symbol as Codec>::Symbol) -> ParamC::Symbol + Clone,
+> {
     pub param_codec: ParamC,
     pub infer: Infer,
 }
 
 impl<
-    ParamC: Codec<Symbol: Codec>,
-    Infer: Fn(&<ParamC::Symbol as Codec>::Symbol) -> ParamC::Symbol + Clone>
-Codec for ParametrizedIndependent<ParamC, Infer> {
+        ParamC: Codec<Symbol: Codec>,
+        Infer: Fn(&<ParamC::Symbol as Codec>::Symbol) -> ParamC::Symbol + Clone,
+    > Codec for ParametrizedIndependent<ParamC, Infer>
+{
     type Symbol = <ParamC::Symbol as Codec>::Symbol;
 
     fn push(&self, m: &mut Message, x: &Self::Symbol) {
@@ -412,15 +569,19 @@ Codec for ParametrizedIndependent<ParamC, Infer> {
 pub struct WrappedParametrizedIndependent<
     ParamC: Codec<Symbol: Codec>,
     Infer: Fn(&<ParamC::Symbol as Codec>::Symbol) -> ParamC::Symbol + Clone,
-    C: Symbol + Codec> {
+    C: Symbol + Codec,
+> {
     pub parametrized_codec: ParametrizedIndependent<ParamC, Infer>,
     pub codec_from_inner: Box<dyn Fn(ParamC::Symbol) -> C>,
     pub data_to_inner: Box<dyn Fn(C::Symbol) -> <ParamC::Symbol as Codec>::Symbol>,
 }
 
-impl<ParamC: Codec<Symbol: Codec>,
-    Infer: Fn(&<ParamC::Symbol as Codec>::Symbol) -> ParamC::Symbol + Clone, C: Symbol + Codec>
-Codec for WrappedParametrizedIndependent<ParamC, Infer, C> {
+impl<
+        ParamC: Codec<Symbol: Codec>,
+        Infer: Fn(&<ParamC::Symbol as Codec>::Symbol) -> ParamC::Symbol + Clone,
+        C: Symbol + Codec,
+    > Codec for WrappedParametrizedIndependent<ParamC, Infer, C>
+{
     type Symbol = C::Symbol;
 
     fn push(&self, m: &mut Message, x: &Self::Symbol) {
@@ -436,14 +597,19 @@ Codec for WrappedParametrizedIndependent<ParamC, Infer, C> {
 
     fn bits(&self, x: &Self::Symbol) -> Option<f64> {
         let param = self.infer(x);
-        Some((self.codec_from_inner)(param.clone()).bits(x)? + self.parametrized_codec.param_codec.bits(&param)?)
+        Some(
+            (self.codec_from_inner)(param.clone()).bits(x)?
+                + self.parametrized_codec.param_codec.bits(&param)?,
+        )
     }
 }
 
 impl<
-    ParamC: Codec<Symbol: Codec>,
-    Infer: Fn(&<ParamC::Symbol as Codec>::Symbol) -> ParamC::Symbol + Clone,
-    C: Symbol + Codec> WrappedParametrizedIndependent<ParamC, Infer, C> {
+        ParamC: Codec<Symbol: Codec>,
+        Infer: Fn(&<ParamC::Symbol as Codec>::Symbol) -> ParamC::Symbol + Clone,
+        C: Symbol + Codec,
+    > WrappedParametrizedIndependent<ParamC, Infer, C>
+{
     pub fn infer(&self, x: &<C as Codec>::Symbol) -> ParamC::Symbol {
         (self.parametrized_codec.infer)(&(self.data_to_inner)(x.clone()))
     }
@@ -467,20 +633,30 @@ pub mod tests {
     pub fn param_codecs() {
         UniformParamCodec::new(Uniform::new(10)).test(&Uniform::new(9), 0);
 
-        let masses = vec!(1, 2, 3, 0, 0, 27, 54);
+        let masses = vec![1, 2, 3, 0, 0, 27, 54];
         let label = Categorical::from_iter(masses);
         CategoricalParamCodec.test(&label, 0);
         let edge_index = Bernoulli::new(20, 50);
         BernoulliParamCodec.test(&edge_index, 0);
         let indices = erdos_renyi_indices::<Undirected>(10, edge_index.clone(), false);
-        let indices_param = |nums_nodes, loops|
-            ErdosRenyiParamCodec { nums_nodes, loops, edge_codec: BernoulliParamCodec, phantom: PhantomData };
+        let indices_param = |nums_nodes, loops| ErdosRenyiParamCodec {
+            nums_nodes,
+            loops,
+            edge_codec: BernoulliParamCodec,
+            phantom: PhantomData,
+        };
         indices_param(vec![10], false).test(&vec![indices.clone()], 0);
-        let graphs = Independent::new(vec![GraphIID::new(10, indices, EmptyCodec::default(), label.clone())]);
+        let graphs = Independent::new(vec![GraphIID::new(
+            10,
+            indices,
+            EmptyCodec::default(),
+            label.clone(),
+        )]);
         GraphDatasetParamCodec {
             node: ConstantCodec(EmptyCodec::default()),
             edge: CategoricalParamCodec,
             indices: indices_param,
-        }.test(&graphs, 0);
+        }
+        .test(&graphs, 0);
     }
 }

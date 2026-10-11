@@ -11,8 +11,12 @@
 //!   5. Encode removed edge with p(edge | G_{k-1}) via ANS push
 
 use crate::autoregressive::prefix_orbit::{FixPrefixOrbitCodec, PrefixOrbitCodec, VecOrbits};
-use crate::autoregressive::{InnerSliceCodecs, PrefixFn, PrefixingChain, UnfusedAutoregressiveShuffleCodec};
+use crate::autoregressive::{
+    InnerSliceCodecs, PrefixFn, PrefixingChain, UnfusedAutoregressiveShuffleCodec,
+};
 use crate::codec::{Categorical, Codec, LogUniform, Message, Uniform};
+use crate::experimental::complete_joint::aut::AutCanonizable;
+use crate::experimental::complete_joint::graph::NodeLabelledGraph;
 use crate::graph::{ColorRefinement, EdgeIndex, PlainGraph, Undirected};
 use crate::permutable::{Hashing, Len, Permutable, Unordered};
 use ftree::FenwickTree;
@@ -69,7 +73,19 @@ impl Permutable for EdgePrefix {
 /// Slice = one removed edge.
 pub type EdgeSlice = EdgeIndex;
 
-fn canon_edge((u,v): EdgeIndex) -> EdgeIndex { if u < v {(u,v)} else {(v,u)} }
+fn canon_edge((u, v): EdgeIndex) -> EdgeIndex {
+    if u < v {
+        (u, v)
+    } else {
+        (v, u)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EdgeOrbitMode {
+    ColorRefinement,
+    Full,
+}
 
 // ============================================================================
 // PREFIXING CHAIN
@@ -84,7 +100,9 @@ pub struct EdgePrefixingChain {
 
 impl EdgePrefixingChain {
     pub fn new() -> Self {
-        Self { phantom: PhantomData }
+        Self {
+            phantom: PhantomData,
+        }
     }
 }
 
@@ -120,7 +138,11 @@ impl PrefixingChain for EdgePrefixingChain {
             g.insert_plain_edge(canon_edge(e));
         }
         let len_active = full.edges.len();
-        EdgePrefix { g, list: full, len_active }
+        EdgePrefix {
+            g,
+            list: full,
+            len_active,
+        }
     }
 
     fn full(&self, prefix: Self::Prefix) -> Self::Full {
@@ -141,7 +163,11 @@ impl PrefixingChain for EdgePrefixingChain {
 ///
 /// Edges in the same bucket share the same computed id at that step,
 /// but the id can change after removals because colors/degrees change.
-fn edge_sig(node_color: &[usize], deg: &[usize], (u, v): EdgeIndex) -> (usize, usize, usize, usize) {
+fn edge_sig(
+    node_color: &[usize],
+    deg: &[usize],
+    (u, v): EdgeIndex,
+) -> (usize, usize, usize, usize) {
     let (cu, cv) = (node_color[u], node_color[v]);
     let (du, dv) = (deg[u], deg[v]);
     let c0 = cu.min(cv);
@@ -151,21 +177,14 @@ fn edge_sig(node_color: &[usize], deg: &[usize], (u, v): EdgeIndex) -> (usize, u
     (c0, c1, d0, d1)
 }
 
-
 /// Hash the edge signature into a single u64 for orbit partitioning.
 fn hash_sig(sig: (usize, usize, usize, usize)) -> u64 {
     let (a, b, c, d) = sig;
 
     let mut x: u64 = (a as u64).wrapping_mul(0x9E3779B97F4A7C15);
-    x ^= (b as u64)
-        .wrapping_add(0xD1B54A32D192ED03)
-        .rotate_left(17);
-    x ^= (c as u64)
-        .wrapping_mul(0x94D049BB133111EB)
-        .rotate_left(31);
-    x ^= (d as u64)
-        .wrapping_mul(0xBF58476D1CE4E5B9)
-        .rotate_left(47);
+    x ^= (b as u64).wrapping_add(0xD1B54A32D192ED03).rotate_left(17);
+    x ^= (c as u64).wrapping_mul(0x94D049BB133111EB).rotate_left(31);
+    x ^= (d as u64).wrapping_mul(0xBF58476D1CE4E5B9).rotate_left(47);
 
     x
 }
@@ -174,8 +193,8 @@ fn n_choose_2(n: usize) -> usize {
     n.saturating_sub(1).saturating_mul(n) / 2
 }
 
-/// Mass proportional to p(e_k | G_{k-1}) under ER G(n,m), for removed edge e in G_k.
-/// We use the collapsed class masses:
+/// Mass proportional to the practical quotient p(e_k | G_{k-1}) under ER G(n,m), for removed
+/// edge e in G_k. We use the collapsed class masses:
 ///   KK -> 1, KN -> |inactive(H)|, NN -> C(|inactive(H)|,2),
 /// where H = G_k \ {e}. The common 1/C denominator is omitted since q renormalizes.
 fn er_gnm_q_mass_for_removed_edge(
@@ -188,9 +207,7 @@ fn er_gnm_q_mass_for_removed_edge(
     let du_h = deg_in_gk[u] - 1;
     let dv_h = deg_in_gk[v] - 1;
 
-    let active_h = active_nodes_in_gk
-        - (deg_in_gk[u] == 1) as usize
-        - (deg_in_gk[v] == 1) as usize;
+    let active_h = active_nodes_in_gk - (deg_in_gk[u] == 1) as usize - (deg_in_gk[v] == 1) as usize;
     let inactive_h = n - active_h;
 
     match (du_h > 0, dv_h > 0) {
@@ -200,24 +217,60 @@ fn er_gnm_q_mass_for_removed_edge(
     }
 }
 
-fn weighted_fix_prefix_orbit_codec(ids: Vec<u64>, elem_masses: Vec<usize>, len: usize) -> FixPrefixOrbitCodec {
+fn exact_edge_orbit_ids(g: &PlainGraph<Undirected>, active_edges: &[EdgeIndex]) -> Vec<i32> {
+    let n = g.len();
+    let mut incidence = NodeLabelledGraph::<Undirected>::empty((0..n).map(|_| 0usize));
+
+    for (i, &(u, v)) in active_edges.iter().enumerate() {
+        let edge_node = n + i;
+        incidence.nodes.push((1usize, Default::default()));
+        assert!(incidence.insert_plain_edge((u, edge_node)));
+        assert!(incidence.insert_plain_edge((v, edge_node)));
+    }
+
+    let automorphisms = incidence.automorphisms();
+    active_edges
+        .iter()
+        .enumerate()
+        .map(|(i, _)| automorphisms.orbit_ids[n + i])
+        .collect()
+}
+
+fn weighted_fix_prefix_orbit_codec(
+    ids: Vec<u64>,
+    elem_masses: Vec<usize>,
+    len: usize,
+) -> FixPrefixOrbitCodec {
     let mut uniq = ids.clone();
     uniq.sort_unstable();
     uniq.dedup();
-    let rank: HashMap<u64, usize> = uniq.into_iter().enumerate().map(|(i, id)| (id, i)).collect();
+    let rank: HashMap<u64, usize> = uniq
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| (id, i))
+        .collect();
     let ranked_ids = ids.iter().map(|id| rank[id]).collect_vec();
     let orbits = VecOrbits::new(ranked_ids.clone(), len);
     let orbit_masses = orbits.orbits.iter().map(|r| {
-        orbits.indices[r.clone()].iter().map(|&edge_pos| elem_masses[edge_pos]).sum::<usize>()
+        orbits.indices[r.clone()]
+            .iter()
+            .map(|&edge_pos| elem_masses[edge_pos])
+            .sum::<usize>()
     });
     let categorical = FenwickTree::from_iter(orbit_masses);
-    PrefixOrbitCodec { ids: ranked_ids, len, orbits, categorical }
+    PrefixOrbitCodec {
+        ids: ranked_ids,
+        len,
+        orbits,
+        categorical,
+    }
 }
 
 /// ER-specific orbit q-codecs: q(e_k | G_k) ∝ p(e_k | G_{k-1}) with ER G(n,m),
 /// then q(c_k | G_k) is the sum over edges in the same color class.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EREdgeQCodecs {
+    pub mode: EdgeOrbitMode,
     pub cr: ColorRefinement,
 }
 
@@ -228,23 +281,40 @@ impl PrefixFn<EdgePrefixingChain> for EREdgeQCodecs {
         // Remaining graph G_k:
         let g = &x.g;
 
-        // Node colors from color refinement.
-        let colors: Vec<usize> = <ColorRefinement as Hashing<PlainGraph<Undirected>>>::apply(&self.cr, g);
-
-        // Degrees:
+        // Degrees determine the ER q-mass after removing each edge.
         let deg = g.degrees().collect_vec();
-
         let active_nodes_in_gk = deg.iter().filter(|&&d| d > 0).count();
 
-        // For active edges in G_k, compute color id and q(e) mass.
-        let mut ids: Vec<u64> = Vec::with_capacity(x.len_active);
-        let mut masses: Vec<usize> = Vec::with_capacity(x.len_active);
-        for &e in x.list.edges[..x.len_active].iter() {
-            let e = canon_edge(e);
-            let sig = edge_sig(&colors, &deg, e);
-            ids.push(hash_sig(sig));
-            masses.push(er_gnm_q_mass_for_removed_edge(x.list.n, active_nodes_in_gk, &deg, e));
-        }
+        let active_edges = x.list.edges[..x.len_active]
+            .iter()
+            .map(|&e| canon_edge(e))
+            .collect_vec();
+        let ids: Vec<u64> = match self.mode {
+            EdgeOrbitMode::ColorRefinement => {
+                let colors: Vec<usize> =
+                    <ColorRefinement as Hashing<PlainGraph<Undirected>>>::apply(&self.cr, g);
+                active_edges
+                    .iter()
+                    .map(|&e| hash_sig(edge_sig(&colors, &deg, e)))
+                    .collect()
+            }
+            EdgeOrbitMode::Full => exact_edge_orbit_ids(g, &active_edges)
+                .into_iter()
+                .map(|id| id as u64)
+                .collect(),
+        };
+
+        let masses = match self.mode {
+            EdgeOrbitMode::ColorRefinement => active_edges
+                .iter()
+                .map(|&e| er_gnm_q_mass_for_removed_edge(x.list.n, active_nodes_in_gk, &deg, e))
+                .collect_vec(),
+            // In the exact full model, the latent is the concrete labelled edge. Under
+            // G(n,m), every predecessor labelled graph with k-1 edges is equally likely and
+            // every such predecessor adds one missing edge uniformly, so each removable edge in
+            // G_k has the same posterior mass. Orbit masses are therefore just orbit sizes.
+            EdgeOrbitMode::Full => vec![1; active_edges.len()],
+        };
 
         weighted_fix_prefix_orbit_codec(ids, masses, x.len_active)
     }
@@ -255,7 +325,12 @@ impl PrefixFn<EdgePrefixingChain> for EREdgeQCodecs {
         *image = self.apply(x);
     }
 
-    fn update_after_push_slice(&self, image: &mut Self::Output, x: &EdgePrefix, _slice: &EdgeSlice) {
+    fn update_after_push_slice(
+        &self,
+        image: &mut Self::Output,
+        x: &EdgePrefix,
+        _slice: &EdgeSlice,
+    ) {
         *image = self.apply(x);
     }
 
@@ -471,7 +546,9 @@ impl EdgeRemovalModel for OrbitCandidateP {
 pub struct ErdosRenyiGnM;
 
 impl ErdosRenyiGnM {
-    pub const fn new() -> Self { Self }
+    pub const fn new() -> Self {
+        Self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -506,16 +583,23 @@ impl ErdosRenyiGnMEdgeCodec {
         }
         kk_candidates.sort();
 
-        Self { active_nodes, inactive_nodes, is_active, kk_candidates }
+        Self {
+            active_nodes,
+            inactive_nodes,
+            is_active,
+            kk_candidates,
+        }
     }
 
     fn type_masses(&self) -> (usize, usize, usize) {
         let kk = self.kk_candidates.len();
-        let kn = self.active_nodes.len().saturating_mul(self.inactive_nodes.len());
+        let kn = self
+            .active_nodes
+            .len()
+            .saturating_mul(self.inactive_nodes.len());
         let nn = Self::n_choose_2(self.inactive_nodes.len());
         (kk, kn, nn)
     }
-
 }
 
 impl Codec for ErdosRenyiGnMEdgeCodec {
@@ -529,7 +613,9 @@ impl Codec for ErdosRenyiGnMEdgeCodec {
         let type_codec = Categorical::from_iter(vec![kk_mass, kn_mass, nn_mass]);
 
         if u_active && v_active {
-            let idx = self.kk_candidates.binary_search(&(u0, v0))
+            let idx = self
+                .kk_candidates
+                .binary_search(&(u0, v0))
                 .expect("KK edge not in candidate set");
             Uniform::new(self.kk_candidates.len()).push(m, &idx);
             type_codec.push(m, &0);
@@ -538,16 +624,28 @@ impl Codec for ErdosRenyiGnMEdgeCodec {
 
         if u_active ^ v_active {
             let (known, new_) = if u_active { (u0, v0) } else { (v0, u0) };
-            let k = self.active_nodes.binary_search(&known).expect("Known endpoint not active");
-            assert!(self.inactive_nodes.binary_search(&new_).is_ok(), "New endpoint not inactive");
+            let k = self
+                .active_nodes
+                .binary_search(&known)
+                .expect("Known endpoint not active");
+            assert!(
+                self.inactive_nodes.binary_search(&new_).is_ok(),
+                "New endpoint not inactive"
+            );
             Uniform::new(self.active_nodes.len()).push(m, &k);
             type_codec.push(m, &1);
             return;
         }
 
         // NN: both endpoints inactive. Structure-only quotient symbol: no inactive-identity coding.
-        assert!(self.inactive_nodes.binary_search(&u0).is_ok(), "NN endpoint not inactive");
-        assert!(self.inactive_nodes.binary_search(&v0).is_ok(), "NN endpoint not inactive");
+        assert!(
+            self.inactive_nodes.binary_search(&u0).is_ok(),
+            "NN endpoint not inactive"
+        );
+        assert!(
+            self.inactive_nodes.binary_search(&v0).is_ok(),
+            "NN endpoint not inactive"
+        );
         type_codec.push(m, &2);
     }
 
@@ -561,19 +659,30 @@ impl Codec for ErdosRenyiGnMEdgeCodec {
             }
             1 => {
                 let k = Uniform::new(self.active_nodes.len()).pop(m);
-                let new_ = *self.inactive_nodes.first().expect("KN requires at least one inactive node");
+                let new_ = *self
+                    .inactive_nodes
+                    .first()
+                    .expect("KN requires at least one inactive node");
                 canon_edge((self.active_nodes[k], new_))
             }
             2 => {
-                let a = *self.inactive_nodes.first().expect("NN requires at least two inactive nodes");
-                let b = *self.inactive_nodes.get(1).expect("NN requires at least two inactive nodes");
+                let a = *self
+                    .inactive_nodes
+                    .first()
+                    .expect("NN requires at least two inactive nodes");
+                let b = *self
+                    .inactive_nodes
+                    .get(1)
+                    .expect("NN requires at least two inactive nodes");
                 canon_edge((a, b))
             }
             _ => panic!("Invalid canonical edge type {t}"),
         }
     }
 
-    fn bits(&self, _x: &Self::Symbol) -> Option<f64> { None }
+    fn bits(&self, _x: &Self::Symbol) -> Option<f64> {
+        None
+    }
 }
 
 impl EdgeRemovalModel for ErdosRenyiGnM {
@@ -581,6 +690,72 @@ impl EdgeRemovalModel for ErdosRenyiGnM {
 
     fn codec_for_removed_edge(&self, prefix_after_removal: &EdgePrefix) -> Self::SliceCodec {
         ErdosRenyiGnMEdgeCodec::build(prefix_after_removal)
+    }
+}
+
+
+/// Exact G(n,m) model over concrete labelled missing edges.
+///
+/// This is the theoretical full p model: every missing edge in G_{k-1} has equal probability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactErdosRenyiGnM;
+
+impl ExactErdosRenyiGnM {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExactErdosRenyiGnMEdgeCodec {
+    candidates: Vec<EdgeIndex>,
+}
+
+impl ExactErdosRenyiGnMEdgeCodec {
+    fn build(prefix_after_removal: &EdgePrefix) -> Self {
+        let g = &prefix_after_removal.g;
+        let n = prefix_after_removal.list.n;
+        let mut candidates = Vec::new();
+        for u in 0..n {
+            for v in (u + 1)..n {
+                let e = canon_edge((u, v));
+                if !g.has_edge(&e) {
+                    candidates.push(e);
+                }
+            }
+        }
+        candidates.sort_unstable();
+        Self { candidates }
+    }
+
+    fn locate_candidate(&self, e: EdgeIndex) -> usize {
+        self.candidates
+            .binary_search(&canon_edge(e))
+            .expect("edge not in exact ER candidate set")
+    }
+}
+
+impl Codec for ExactErdosRenyiGnMEdgeCodec {
+    type Symbol = EdgeIndex;
+
+    fn push(&self, m: &mut Message, x: &Self::Symbol) {
+        Uniform::new(self.candidates.len()).push(m, &self.locate_candidate(*x));
+    }
+
+    fn pop(&self, m: &mut Message) -> Self::Symbol {
+        self.candidates[Uniform::new(self.candidates.len()).pop(m)]
+    }
+
+    fn bits(&self, _x: &Self::Symbol) -> Option<f64> {
+        None
+    }
+}
+
+impl EdgeRemovalModel for ExactErdosRenyiGnM {
+    type SliceCodec = ExactErdosRenyiGnMEdgeCodec;
+
+    fn codec_for_removed_edge(&self, prefix_after_removal: &EdgePrefix) -> Self::SliceCodec {
+        ExactErdosRenyiGnMEdgeCodec::build(prefix_after_removal)
     }
 }
 
@@ -609,60 +784,63 @@ impl<M: EdgeRemovalModel> InnerSliceCodecs<EdgePrefixingChain> for EdgeSliceCode
     }
 
     fn empty_prefix(&self) -> impl Codec<Symbol = EdgePrefix> {
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct EmptyPrefixNm;
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct EmptyPrefixNm;
 
-    impl Codec for EmptyPrefixNm {
-        type Symbol = EdgePrefix;
+        impl Codec for EmptyPrefixNm {
+            type Symbol = EdgePrefix;
 
-        fn push(&self, m: &mut Message, x: &Self::Symbol) {
-            // At the end of encoding, x should be the empty remaining graph G_0:
-            debug_assert_eq!(x.len_active, 0);
+            fn push(&self, m: &mut Message, x: &Self::Symbol) {
+                // At the end of encoding, x should be the empty remaining graph G_0:
+                debug_assert_eq!(x.len_active, 0);
 
-            let n = x.list.n;
-            let m_edges = x.list.edges.len();
+                let n = x.list.n;
+                let m_edges = x.list.edges.len();
 
-            // IMPORTANT (ANS stack order):
-            // Whatever you push last is popped first.
-            // We want pop() to read n first, then m.
-            // So we push m first, then n.
-            LogUniform::max().push(m, &m_edges);
-            LogUniform::max().push(m, &n);
+                // IMPORTANT (ANS stack order):
+                // Whatever you push last is popped first.
+                // We want pop() to read n first, then m.
+                // So we push m first, then n.
+                LogUniform::max().push(m, &m_edges);
+                LogUniform::max().push(m, &n);
+            }
+
+            fn pop(&self, m: &mut Message) -> Self::Symbol {
+                // Inverse of push(): pop n first (it was pushed last), then m.
+                let n = LogUniform::max().pop(m);
+                let m_edges = LogUniform::max().pop(m);
+
+                // Build the empty prefix state expected by the shuffle decoder:
+                // - empty graph on n nodes
+                // - edge list of length m (preallocated, values irrelevant while len_active=0)
+                // - len_active=0
+                let g = PlainGraph::<Undirected>::plain_empty(n);
+
+                // Fill with a dummy edge index; it's never read while len_active==0.
+                // (push_slice() will overwrite positions 0..m-1 during decoding.)
+                let dummy = (0usize, 0usize);
+                let list = EdgeList {
+                    n,
+                    edges: vec![dummy; m_edges],
+                };
+
+                EdgePrefix {
+                    g,
+                    list,
+                    len_active: 0,
+                }
+            }
+
+            fn bits(&self, x: &Self::Symbol) -> Option<f64> {
+                let n = x.list.n;
+                let m_edges = x.list.edges.len();
+                // Must match push() order/contents; sum is commutative anyway.
+                Some(LogUniform::max().bits(&n)? + LogUniform::max().bits(&m_edges)?)
+            }
         }
 
-        fn pop(&self, m: &mut Message) -> Self::Symbol {
-            // Inverse of push(): pop n first (it was pushed last), then m.
-            let n = LogUniform::max().pop(m);
-            let m_edges = LogUniform::max().pop(m);
-
-            // Build the empty prefix state expected by the shuffle decoder:
-            // - empty graph on n nodes
-            // - edge list of length m (preallocated, values irrelevant while len_active=0)
-            // - len_active=0
-            let g = PlainGraph::<Undirected>::plain_empty(n);
-
-            // Fill with a dummy edge index; it's never read while len_active==0.
-            // (push_slice() will overwrite positions 0..m-1 during decoding.)
-            let dummy = (0usize, 0usize);
-            let list = EdgeList {
-                n,
-                edges: vec![dummy; m_edges],
-            };
-
-            EdgePrefix { g, list, len_active: 0 }
-        }
-
-        fn bits(&self, x: &Self::Symbol) -> Option<f64> {
-            let n = x.list.n;
-            let m_edges = x.list.edges.len();
-            // Must match push() order/contents; sum is commutative anyway.
-            Some(LogUniform::max().bits(&n)? + LogUniform::max().bits(&m_edges)?)
-        }
+        EmptyPrefixNm
     }
-
-    EmptyPrefixNm
-}
-
 }
 
 impl<M: EdgeRemovalModel> PrefixFn<EdgePrefixingChain> for EdgeSliceCodecs<M> {
@@ -676,7 +854,12 @@ impl<M: EdgeRemovalModel> PrefixFn<EdgePrefixingChain> for EdgeSliceCodecs<M> {
         *image = self.apply(x);
     }
 
-    fn update_after_push_slice(&self, image: &mut Self::Output, x: &EdgePrefix, _slice: &EdgeSlice) {
+    fn update_after_push_slice(
+        &self,
+        image: &mut Self::Output,
+        x: &EdgePrefix,
+        _slice: &EdgeSlice,
+    ) {
         *image = self.apply(x);
     }
 
@@ -686,6 +869,7 @@ impl<M: EdgeRemovalModel> PrefixFn<EdgePrefixingChain> for EdgeSliceCodecs<M> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Type2EdgeOrbitGraphCodec<M: EdgeRemovalModel> {
     pub convs: usize,
+    pub orbit_mode: EdgeOrbitMode,
     pub model: M,
 }
 
@@ -695,7 +879,13 @@ impl<M: EdgeRemovalModel> Codec for Type2EdgeOrbitGraphCodec<M> {
     fn push(&self, msg: &mut Message, Unordered(g): &Self::Symbol) {
         let n = g.len();
         let edges = g.edge_indices();
-        let inner = type2_edge_orbit_codec(n, edges.clone(), self.convs, self.model.clone());
+        let inner = type2_edge_orbit_codec(
+            n,
+            edges.clone(),
+            self.convs,
+            self.orbit_mode,
+            self.model.clone(),
+        );
         inner.push(msg, &Unordered(EdgeList { n, edges }));
     }
 
@@ -711,7 +901,13 @@ impl<M: EdgeRemovalModel> Codec for Type2EdgeOrbitGraphCodec<M> {
 
         // Create dummy edges vector of correct length.
         let dummy_edges = vec![(0usize, 0usize); m];
-        let inner = type2_edge_orbit_codec(n, dummy_edges, self.convs, self.model.clone());
+        let inner = type2_edge_orbit_codec(
+            n,
+            dummy_edges,
+            self.convs,
+            self.orbit_mode,
+            self.model.clone(),
+        );
         let Unordered(edge_list) = inner.pop(msg);
 
         let mut g = PlainGraph::<Undirected>::plain_empty(edge_list.n);
@@ -721,7 +917,9 @@ impl<M: EdgeRemovalModel> Codec for Type2EdgeOrbitGraphCodec<M> {
         Unordered(g)
     }
 
-    fn bits(&self, _x: &Self::Symbol) -> Option<f64> { None }
+    fn bits(&self, _x: &Self::Symbol) -> Option<f64> {
+        None
+    }
 }
 
 // ============================================================================
@@ -734,6 +932,7 @@ pub fn type2_edge_orbit_codec<M: EdgeRemovalModel>(
     n: usize,
     edges: Vec<EdgeIndex>,
     convs: usize,
+    orbit_mode: EdgeOrbitMode,
     model: M,
 ) -> UnfusedAutoregressiveShuffleCodec<EdgePrefixingChain, EdgeSliceCodecs<M>, EREdgeQCodecs> {
     // Build "full" ordered object:
@@ -741,8 +940,15 @@ pub fn type2_edge_orbit_codec<M: EdgeRemovalModel>(
     let m = full.len();
 
     let chain = EdgePrefixingChain::new();
-    let slices = EdgeSliceCodecs { chain: chain.clone(), model, m };
-    let orbit_codecs = EREdgeQCodecs { cr: ColorRefinement::new(convs, false) };
+    let slices = EdgeSliceCodecs {
+        chain: chain.clone(),
+        model,
+        m,
+    };
+    let orbit_codecs = EREdgeQCodecs {
+        mode: orbit_mode,
+        cr: ColorRefinement::new(convs, false),
+    };
 
     UnfusedAutoregressiveShuffleCodec::new(slices, orbit_codecs)
 }
@@ -904,6 +1110,7 @@ mod tests {
 
         let codec = Type2EdgeOrbitGraphCodec {
             convs: 2,
+            orbit_mode: EdgeOrbitMode::ColorRefinement,
             model: ErdosRenyiGnM::new(),
         };
 
@@ -917,6 +1124,51 @@ mod tests {
         orig_edges.sort();
         dec_edges.sort();
         assert_eq!(orig_edges, dec_edges);
+    }
+
+    #[test]
+    fn test_type2_erdos_renyi_gnm_roundtrip_full_orbits() {
+        let mut g = PlainGraph::<Undirected>::plain_empty(5);
+        g.insert_plain_edge((0, 1));
+        g.insert_plain_edge((1, 2));
+        g.insert_plain_edge((2, 3));
+
+        let codec = Type2EdgeOrbitGraphCodec {
+            convs: 2,
+            orbit_mode: EdgeOrbitMode::Full,
+            model: ExactErdosRenyiGnM::new(),
+        };
+
+        let original = Unordered(g);
+        let mut msg = Message::random(11);
+        codec.push(&mut msg, &original);
+        let decoded = codec.pop(&mut msg);
+
+        let mut orig_edges = original.0.edge_indices();
+        let mut dec_edges = decoded.0.edge_indices();
+        orig_edges.sort();
+        dec_edges.sort();
+        assert_eq!(orig_edges, dec_edges);
+    }
+
+    #[test]
+    fn test_full_q_path_uses_exact_edge_orbits_with_uniform_edge_mass() {
+        let edges = vec![(0, 1), (1, 2), (2, 3), (3, 4)];
+        let prefix = EdgePrefixingChain::new().prefix(EdgeList { n: 5, edges });
+        let q = EREdgeQCodecs {
+            mode: EdgeOrbitMode::Full,
+            cr: ColorRefinement::new(2, false),
+        }
+        .apply(&prefix);
+
+        assert_eq!(q.norm(), 4);
+        assert_eq!(q.pmf(&q.id(0)), 2);
+        assert_eq!(q.pmf(&q.id(1)), 2);
+        assert_eq!(q.pmf(&q.id(2)), 2);
+        assert_eq!(q.pmf(&q.id(3)), 2);
+        assert_eq!(q.id(0), q.id(3));
+        assert_eq!(q.id(1), q.id(2));
+        assert_ne!(q.id(0), q.id(1));
     }
 
 }

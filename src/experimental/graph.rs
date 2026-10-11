@@ -598,6 +598,7 @@ pub mod tests {
         }
     }
 
+
     #[test]
     fn sample_polya_urn() {
         for loops in [false, true] {

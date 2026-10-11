@@ -224,8 +224,11 @@ impl Benchmark {
         }
 
         if self.config.t2 {
-            // name it similarly to other CR-based methods
-            let t2_name = format!("cr{}t2", self.config.convs);
+            let t2_name = if self.config.full {
+                "full_t2".to_string()
+            } else {
+                format!("cr{}t2", self.config.convs)
+            };
             print_codec(&t2_name);
         }
 
@@ -603,16 +606,31 @@ impl DatasetBenchmark<'_> {
 
         // One codec per graph (because n,m vary)
         let convs = self.config.convs;
-        let codecs = graphs.iter().map(|_g| {
-            edge_orbit::Type2EdgeOrbitGraphCodec {
-                convs,
-                model: edge_orbit::ErdosRenyiGnM::new(),
-            }
-        }).collect_vec();
 
         with_isomorphism_test_max_len(self.config.isomorphism_test_max_len, || {
-            let codec = Independent::new(codecs);
-            test_and_print_structure_only(&codec, &edge_lists, self.config.seeds());
+            if self.config.full {
+                let codecs = graphs
+                    .iter()
+                    .map(|_g| edge_orbit::Type2EdgeOrbitGraphCodec {
+                        convs,
+                        orbit_mode: edge_orbit::EdgeOrbitMode::Full,
+                        model: edge_orbit::ExactErdosRenyiGnM::new(),
+                    })
+                    .collect_vec();
+                let codec = Independent::new(codecs);
+                test_and_print_structure_only(&codec, &edge_lists, self.config.seeds());
+            } else {
+                let codecs = graphs
+                    .iter()
+                    .map(|_g| edge_orbit::Type2EdgeOrbitGraphCodec {
+                        convs,
+                        orbit_mode: edge_orbit::EdgeOrbitMode::ColorRefinement,
+                        model: edge_orbit::ErdosRenyiGnM::new(),
+                    })
+                    .collect_vec();
+                let codec = Independent::new(codecs);
+                test_and_print_structure_only(&codec, &edge_lists, self.config.seeds());
+            }
         });
     }
 }
@@ -745,6 +763,10 @@ pub struct TestConfig {
     #[clap(long)]
     pub t2: bool,
 
+    /// For the Type-2 edge-orbit benchmark, use exact full automorphism orbits instead
+    /// of the color-refinement approximation.
+    #[clap(long)]
+    pub full: bool,
 
     /// Number of color refinement convolutions used for incomplete shuffle coding.
     #[clap(long, default_value = "4")]
@@ -841,6 +863,7 @@ impl TestConfig {
             seeds: 1,
             isomorphism_test_max_len: usize::MAX,
             t2: true,
+            full: false,
         }
     }
 
